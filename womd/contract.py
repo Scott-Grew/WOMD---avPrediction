@@ -1,0 +1,43 @@
+HISTORY_STEPS = 11
+FUTURE_STEPS = 80
+CURRENT_STEP_INDEX = 10
+TOTAL_STEPS = HISTORY_STEPS + FUTURE_STEPS
+
+MAX_NEIGHBOUR_AGENTS = 32
+MAX_MAP_POLYLINES = 128
+POINTS_PER_POLYLINE = 20
+
+NUM_PREDICTED_MODES = 6
+
+PREDICTED_OBJECT_TYPES = ("TYPE_VEHICLE", "TYPE_PEDESTRIAN", "TYPE_CYCLIST")
+NUM_OBJECT_TYPES = len(PREDICTED_OBJECT_TYPES)
+
+MAP_POLYLINE_KINDS = (
+    "lane",
+    "road_line",
+    "road_edge",
+    "stop_sign",
+    "crosswalk",
+    "speed_bump",
+    "driveway",
+)
+NUM_MAP_POLYLINE_KINDS = len(MAP_POLYLINE_KINDS)
+
+AGENT_FEATURE_DIM = 2 + 2 + 2 + 2 + NUM_OBJECT_TYPES
+MAP_FEATURE_DIM = 2 + 2 + NUM_MAP_POLYLINE_KINDS
+
+MISS_RATE_THRESHOLD_METRES = 2.0
+EVALUATED_HORIZON_STEPS = (30, 50, 80)
+
+SAMPLE_ARRAY_SPEC = {
+    "agent_history": (HISTORY_STEPS, AGENT_FEATURE_DIM),
+    "agent_history_mask": (HISTORY_STEPS,),
+    "neighbour_history": (MAX_NEIGHBOUR_AGENTS, HISTORY_STEPS, AGENT_FEATURE_DIM),
+    "neighbour_history_mask": (MAX_NEIGHBOUR_AGENTS, HISTORY_STEPS),
+    "map_polylines": (MAX_MAP_POLYLINES, POINTS_PER_POLYLINE, MAP_FEATURE_DIM),
+    "map_polylines_mask": (MAX_MAP_POLYLINES, POINTS_PER_POLYLINE),
+    "future_positions": (FUTURE_STEPS, 2),
+    "future_mask": (FUTURE_STEPS,),
+    "frame_origin": (2,),
+    "frame_heading": (),
+}
