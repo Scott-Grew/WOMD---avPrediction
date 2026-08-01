@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing
 import pathlib
 import sys
 
@@ -16,17 +17,16 @@ def synthetic_scenarios(count, seed):
         yield synthetic.random_scenario(scenario_index, random_generator)
 
 
-def tfrecord_scenarios(input_directory):
-    paths = sorted(pathlib.Path(input_directory).glob("*"))
+def record_paths(input_directory):
+    paths = sorted(path for path in pathlib.Path(input_directory).glob("*") if path.is_file())
     if len(paths) == 0:
         raise FileNotFoundError(f"no record files under {input_directory}")
-    for path in paths:
-        yield from tfrecord.read_scenarios(path, scenario_pb2.Scenario)
+    return paths
 
 
-def build(scenarios, output_directory, shard_size, benchmark_targets_only):
+def build_from_scenarios(scenarios, output_directory, name_prefix, shard_size, benchmark_targets_only):
     output_directory = pathlib.Path(output_directory)
-    pending, shard_index, total = [], 0, 0
+    pending, written, total = [], [], 0
     for scenario in scenarios:
         pending.extend(
             features.build_scenario_samples(
@@ -34,17 +34,25 @@ def build(scenarios, output_directory, shard_size, benchmark_targets_only):
             )
         )
         while len(pending) >= shard_size:
-            dataset.write_shard(
-                output_directory / f"shard-{shard_index:06d}.npz", pending[:shard_size]
-            )
+            path = output_directory / f"{name_prefix}-{len(written):04d}.npz"
+            dataset.write_shard(path, pending[:shard_size])
             pending = pending[shard_size:]
-            shard_index += 1
+            written.append(path)
             total += shard_size
     if pending:
-        dataset.write_shard(output_directory / f"shard-{shard_index:06d}.npz", pending)
+        path = output_directory / f"{name_prefix}-{len(written):04d}.npz"
+        dataset.write_shard(path, pending)
+        written.append(path)
         total += len(pending)
-        shard_index += 1
-    return shard_index, total
+    return written, total
+
+
+def stage_record_file(task):
+    path, output_directory, shard_size, benchmark_targets_only = task
+    scenarios = tfrecord.read_scenarios(path, scenario_pb2.Scenario)
+    return build_from_scenarios(
+        scenarios, output_directory, path.name, shard_size, benchmark_targets_only
+    )
 
 
 def main():
@@ -55,20 +63,41 @@ def main():
     parser.add_argument("--count", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shard-size", type=int, default=512)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--benchmark-targets-only", action="store_true")
     arguments = parser.parse_args()
 
     if arguments.source == "synthetic":
-        scenarios = synthetic_scenarios(arguments.count, arguments.seed)
+        results = [
+            build_from_scenarios(
+                synthetic_scenarios(arguments.count, arguments.seed),
+                arguments.output,
+                "synthetic",
+                arguments.shard_size,
+                arguments.benchmark_targets_only,
+            )
+        ]
     else:
         if not arguments.input:
             parser.error("--input is required when --source tfrecord")
-        scenarios = tfrecord_scenarios(arguments.input)
+        tasks = [
+            (path, arguments.output, arguments.shard_size, arguments.benchmark_targets_only)
+            for path in record_paths(arguments.input)
+        ]
+        if arguments.workers > 1:
+            with multiprocessing.Pool(arguments.workers) as pool:
+                results = pool.map(stage_record_file, tasks)
+        else:
+            results = [stage_record_file(task) for task in tasks]
 
-    shard_count, sample_count = build(
-        scenarios, arguments.output, arguments.shard_size, arguments.benchmark_targets_only
-    )
-    print(f"wrote {sample_count} samples across {shard_count} shards to {arguments.output}")
+    written = [path for paths, _ in results for path in paths]
+    sample_count = sum(samples for _, samples in results)
+    if len(set(written)) != len(written):
+        raise RuntimeError(
+            f"shard name collision: {len(written)} writes produced {len(set(written))} files"
+        )
+
+    print(f"wrote {sample_count} samples across {len(written)} shards to {arguments.output}")
 
 
 if __name__ == "__main__":
