@@ -47,8 +47,8 @@ def _agent_track_arrays(track):
     return positions, headings, velocities, extents, valid, type_encoding
 
 
-def _history_feature_block(track, frame_origin, frame_heading):
-    positions, headings, velocities, extents, valid, type_encoding = _agent_track_arrays(track)
+def _history_feature_block(track_arrays, frame_origin, frame_heading):
+    positions, headings, velocities, extents, valid, type_encoding = track_arrays
     history_slice = slice(0, contract.HISTORY_STEPS)
     local_positions = frame.positions_to_agent_frame(
         positions[history_slice], frame_origin, frame_heading
@@ -94,7 +94,7 @@ def _map_feature_polylines(map_feature):
     return kind, chunks
 
 
-def _polyline_feature_block(chunk_local, kind):
+def _polyline_feature_block(chunk_local, kind_index):
     block = np.zeros(
         (contract.POINTS_PER_POLYLINE, contract.MAP_FEATURE_DIM), dtype=np.float32
     )
@@ -105,34 +105,58 @@ def _polyline_feature_block(chunk_local, kind):
         directions = np.diff(chunk_local, axis=0)
         block[: point_count - 1, 2:4] = directions
         block[point_count - 1, 2:4] = directions[-1]
-    block[:point_count, 4 + contract.MAP_POLYLINE_KINDS.index(kind)] = 1.0
+    block[:point_count, 4 + kind_index] = 1.0
     mask[:point_count] = True
     return block, mask
 
 
-def _map_blocks(scenario, frame_origin, frame_heading):
-    candidates = []
-    for map_feature in scenario.map_features:
-        kind, chunks = _map_feature_polylines(map_feature)
-        if kind is None:
-            continue
-        for chunk in chunks:
-            chunk_local = frame.positions_to_agent_frame(chunk, frame_origin, frame_heading)
-            distance = float(np.min(np.linalg.norm(chunk_local, axis=1)))
-            candidates.append((distance, chunk_local, kind))
-    candidates.sort(key=lambda entry: entry[0])
+class ScenarioArrays:
+    def __init__(self, scenario):
+        self.track_arrays = [_agent_track_arrays(track) for track in scenario.tracks]
+        chunks = []
+        kind_indices = []
+        for map_feature in scenario.map_features:
+            kind, feature_chunks = _map_feature_polylines(map_feature)
+            if kind is None:
+                continue
+            chunks.extend(feature_chunks)
+            kind_indices.extend([contract.MAP_POLYLINE_KINDS.index(kind)] * len(feature_chunks))
+        self.map_kind_indices = np.array(kind_indices, dtype=np.int64)
+        self.map_chunk_lengths = np.array([len(chunk) for chunk in chunks], dtype=np.int64)
+        self.map_chunk_starts = np.concatenate(
+            ([0], np.cumsum(self.map_chunk_lengths)[:-1])
+        ).astype(np.int64) if chunks else np.zeros(0, dtype=np.int64)
+        self.map_points = (
+            np.concatenate(chunks) if chunks else np.zeros((0, 2), dtype=np.float64)
+        )
 
+
+def _map_blocks(scenario_arrays, frame_origin, frame_heading):
     polylines = np.zeros(
         (contract.MAX_MAP_POLYLINES, contract.POINTS_PER_POLYLINE, contract.MAP_FEATURE_DIM),
         dtype=np.float32,
     )
     masks = np.zeros((contract.MAX_MAP_POLYLINES, contract.POINTS_PER_POLYLINE), dtype=bool)
-    for slot, (_, chunk_local, kind) in enumerate(candidates[: contract.MAX_MAP_POLYLINES]):
-        polylines[slot], masks[slot] = _polyline_feature_block(chunk_local, kind)
+    if len(scenario_arrays.map_chunk_lengths) == 0:
+        return polylines, masks
+
+    local_points = frame.positions_to_agent_frame(
+        scenario_arrays.map_points, frame_origin, frame_heading
+    )
+    squared_distances = np.einsum("ij,ij->i", local_points, local_points)
+    nearest_squared = np.minimum.reduceat(squared_distances, scenario_arrays.map_chunk_starts)
+    order = np.argsort(nearest_squared, kind="stable")[: contract.MAX_MAP_POLYLINES]
+
+    for slot, chunk_index in enumerate(order):
+        start = scenario_arrays.map_chunk_starts[chunk_index]
+        chunk_local = local_points[start : start + scenario_arrays.map_chunk_lengths[chunk_index]]
+        polylines[slot], masks[slot] = _polyline_feature_block(
+            chunk_local, scenario_arrays.map_kind_indices[chunk_index]
+        )
     return polylines, masks
 
 
-def _neighbour_blocks(scenario, target_index, frame_origin, frame_heading):
+def _neighbour_blocks(scenario, scenario_arrays, target_index, frame_origin, frame_heading):
     candidates = []
     for track_index, track in enumerate(scenario.tracks):
         if track_index == target_index:
@@ -143,7 +167,7 @@ def _neighbour_blocks(scenario, target_index, frame_origin, frame_heading):
         if not current_state.valid:
             continue
         offset = np.array([current_state.center_x, current_state.center_y]) - frame_origin
-        candidates.append((float(np.linalg.norm(offset)), track_index, track))
+        candidates.append((float(np.linalg.norm(offset)), track_index))
     candidates.sort(key=lambda entry: entry[0])
 
     histories = np.zeros(
@@ -151,26 +175,30 @@ def _neighbour_blocks(scenario, target_index, frame_origin, frame_heading):
         dtype=np.float32,
     )
     masks = np.zeros((contract.MAX_NEIGHBOUR_AGENTS, contract.HISTORY_STEPS), dtype=bool)
-    for slot, (_, _, track) in enumerate(candidates[: contract.MAX_NEIGHBOUR_AGENTS]):
+    for slot, (_, track_index) in enumerate(candidates[: contract.MAX_NEIGHBOUR_AGENTS]):
         histories[slot], masks[slot] = _history_feature_block(
-            track, frame_origin, frame_heading
+            scenario_arrays.track_arrays[track_index], frame_origin, frame_heading
         )
     return histories, masks
 
 
-def build_sample(scenario, target_index):
+def build_sample(scenario, target_index, scenario_arrays=None):
+    if scenario_arrays is None:
+        scenario_arrays = ScenarioArrays(scenario)
     target_track = scenario.tracks[target_index]
     current_state = target_track.states[contract.CURRENT_STEP_INDEX]
     frame_origin = np.array([current_state.center_x, current_state.center_y], dtype=np.float64)
     frame_heading = float(current_state.heading)
 
     agent_history, agent_history_mask = _history_feature_block(
-        target_track, frame_origin, frame_heading
+        scenario_arrays.track_arrays[target_index], frame_origin, frame_heading
     )
     neighbour_history, neighbour_history_mask = _neighbour_blocks(
-        scenario, target_index, frame_origin, frame_heading
+        scenario, scenario_arrays, target_index, frame_origin, frame_heading
     )
-    map_polylines, map_polylines_mask = _map_blocks(scenario, frame_origin, frame_heading)
+    map_polylines, map_polylines_mask = _map_blocks(
+        scenario_arrays, frame_origin, frame_heading
+    )
 
     future_positions = np.zeros((contract.FUTURE_STEPS, 2), dtype=np.float32)
     future_mask = np.zeros(contract.FUTURE_STEPS, dtype=bool)
@@ -202,9 +230,10 @@ def build_sample(scenario, target_index):
 
 
 def build_scenario_samples(scenario, benchmark_targets_only=False, require_full_future=True):
+    scenario_arrays = ScenarioArrays(scenario)
     samples = []
     for target_index in predictable_track_indices(scenario, benchmark_targets_only):
-        sample = build_sample(scenario, target_index)
+        sample = build_sample(scenario, target_index, scenario_arrays)
         if require_full_future and not sample["future_mask"].all():
             continue
         samples.append(sample)
