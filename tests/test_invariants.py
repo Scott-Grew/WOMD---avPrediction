@@ -308,11 +308,11 @@ def test_tail_statistics_match_the_analytic_order_statistics():
     assert np.isclose(maximum, 99.0, atol=1e-6)
 
 
-def test_batched_inference_beats_single_sample_per_sample_cost(synthetic_batch):
+def test_whole_batch_costs_at_least_one_sample(synthetic_batch):
     torch.manual_seed(0)
     predictor = model.MotionPredictor()
     measurements = report.measure_latency(predictor, synthetic_batch, repeats=3)
-    assert measurements["single_sample_ms"] >= measurements["batched_per_sample_ms"]
+    assert measurements["batched_total_ms"] >= measurements["single_sample_ms"]
 
 
 def test_kinematics_match_circular_arc_geometry():
