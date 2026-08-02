@@ -14,6 +14,7 @@ from womd import (
     loss,
     metrics,
     model,
+    offroad,
     report,
     synthetic,
     tfrecord,
@@ -327,6 +328,59 @@ def test_kinematics_match_circular_arc_geometry():
     quantities, moving = kinematics.motion_quantities(arc, window_steps=1)
     assert np.isclose(quantities["lateral"][moving].mean().item(), speed**2 / radius, atol=1e-3)
     assert np.isclose(quantities["yaw_rate"][moving].mean().item(), angular_rate, atol=1e-3)
+
+
+def _map_batch(polylines):
+    tensor = torch.zeros(
+        1, contract.MAX_MAP_POLYLINES, contract.POINTS_PER_POLYLINE, contract.MAP_FEATURE_DIM
+    )
+    mask = torch.zeros(
+        1, contract.MAX_MAP_POLYLINES, contract.POINTS_PER_POLYLINE, dtype=torch.bool
+    )
+    for slot, (kind, points) in enumerate(polylines):
+        tensor[0, slot, : len(points), contract.MAP_POSITION] = torch.tensor(points)
+        tensor[0, slot, : len(points), contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index(kind)] = 1.0
+        mask[0, slot, : len(points)] = True
+    return tensor, mask
+
+
+def _straight_polyline(offset_y, point_count=contract.POINTS_PER_POLYLINE):
+    return [(index * 0.5 - 5.0, offset_y) for index in range(point_count)]
+
+
+def test_offroad_distance_equals_the_offset_from_the_drivable_centreline():
+    polylines, mask = _map_batch(
+        [
+            ("lane", _straight_polyline(0.0)),
+            ("road_line", _straight_polyline(3.0)),
+            ("lane", [(50.0, 0.0)]),
+        ]
+    )
+    steps = contract.OFFROAD_HORIZON_STEPS
+    for offset, expected_rate in ((0.5, 0.0), (3.0, 1.0)):
+        trajectory = torch.zeros(1, 1, steps, 2)
+        trajectory[..., 1] = offset
+        distances = offroad.distances_to_drivable(trajectory, polylines, mask)
+        assert np.isclose(distances.min().item(), offset, atol=1e-5)
+        rate, covered = offroad.rate_and_coverage(
+            trajectory, polylines, mask, steps, contract.OFFROAD_DISTANCE_LIMIT_METRES
+        )
+        assert covered.item()
+        assert np.isclose(rate.item(), expected_rate)
+
+
+def test_offroad_coverage_excludes_trajectories_leaving_the_map_crop():
+    polylines, mask = _map_batch(
+        [("lane", _straight_polyline(0.0)), ("lane", [(50.0, 0.0)])]
+    )
+    steps = contract.OFFROAD_HORIZON_STEPS
+    inside = torch.zeros(1, 1, steps, 2)
+    outside = torch.full((1, 1, steps, 2), 80.0)
+    for trajectory, expected in ((inside, True), (outside, False)):
+        _, covered = offroad.rate_and_coverage(
+            trajectory, polylines, mask, steps, contract.OFFROAD_DISTANCE_LIMIT_METRES
+        )
+        assert covered.item() is expected
 
 
 def test_constant_velocity_predictions_are_never_implausible(synthetic_batch):

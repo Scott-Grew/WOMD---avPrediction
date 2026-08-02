@@ -94,6 +94,37 @@ def render_latency(measurements):
     )
 
 
+VEHICLE_TYPE_INDEX = contract.PREDICTED_OBJECT_TYPES.index("TYPE_VEHICLE")
+OFFROAD_SOURCE_ORDER = ("model", "const-vel", "logged")
+
+
+def offroad_selection(labels):
+    return (labels["agent_type"] == VEHICLE_TYPE_INDEX) & (
+        labels["manoeuvre"] != STATIONARY
+    )
+
+
+def render_offroad(offroad_rates):
+    scored = offroad_rates["covered"]
+    sample_count = scored.shape[0]
+    covered_count = int(scored.sum())
+    horizon_seconds = contract.OFFROAD_HORIZON_STEPS / 10.0
+    lines = [
+        f"off-road rate @{horizon_seconds:g}s — predicted steps farther than "
+        f"{contract.OFFROAD_DISTANCE_LIMIT_METRES:g} m from a mapped lane or driveway centreline",
+        f"scored on moving vehicles whose logged future stays inside the map crop: "
+        f"{covered_count} of {sample_count} samples ({covered_count / sample_count:.1%})",
+        f"{'source':<14}{'n':>7}{'rate':>10}",
+    ]
+    if covered_count == 0:
+        return "\n".join(lines)
+    for source in OFFROAD_SOURCE_ORDER:
+        lines.append(
+            f"{source:<14}{covered_count:>7}{offroad_rates[source][scored].mean().item():>10.3f}"
+        )
+    return "\n".join(lines)
+
+
 def _reduce(per_sample, selected):
     return metrics.reduce_per_sample(
         {name: values[selected] for name, values in per_sample.items()}
