@@ -295,3 +295,13 @@ def test_report_slices_partition_every_sample(synthetic_batch):
     for name, names in report.SLICE_NAMES.items():
         counts = [int((labels[name] == value).sum()) for value in range(len(names))]
         assert sum(counts) == sample_count
+
+
+def test_tail_statistics_match_the_analytic_order_statistics():
+    values = torch.arange(100, dtype=torch.float32)
+    median, p90, p95, p99, maximum = report.tail_statistics(values)
+    assert np.isclose(median, 49.5, atol=1e-4)
+    assert np.isclose(p90, 89.1, atol=1e-4)
+    assert np.isclose(p95, 94.05, atol=1e-4)
+    assert np.isclose(p99, 98.01, atol=1e-4)
+    assert np.isclose(maximum, 99.0, atol=1e-6)

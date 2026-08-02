@@ -59,6 +59,22 @@ def _reduce(per_sample, selected):
     )
 
 
+TAIL_QUANTILES = (0.5, 0.9, 0.95, 0.99)
+TAIL_HEADINGS = ("median", "p90", "p95", "p99", "max")
+
+
+def tail_statistics(values):
+    quantiles = torch.quantile(
+        values, torch.tensor(TAIL_QUANTILES, dtype=values.dtype)
+    ).tolist()
+    return quantiles + [values.max().item()]
+
+
+def _tail_row(label, count, values):
+    cells = "".join(f"{statistic:>10.3f}" for statistic in tail_statistics(values))
+    return f"{label:<14}{count:>7}{cells}"
+
+
 def _row(label, count, model_results, baseline_results, columns):
     cells = "".join(
         f"{model_results[column]:>10.3f}{baseline_results[column]:>10.3f}"
@@ -94,6 +110,7 @@ def render(model_per_sample, baseline_per_sample, labels=None, columns=None):
     if labels is None:
         return "\n".join(lines)
 
+    selections = [("all", everything)]
     for slice_name, names in SLICE_NAMES.items():
         lines.append("")
         for value, name in enumerate(names):
@@ -101,6 +118,7 @@ def render(model_per_sample, baseline_per_sample, labels=None, columns=None):
             count = int(selected.sum())
             if count == 0:
                 continue
+            selections.append((name, selected))
             lines.append(
                 _row(
                     name,
@@ -110,4 +128,17 @@ def render(model_per_sample, baseline_per_sample, labels=None, columns=None):
                     columns,
                 )
             )
+
+    headline = f"minADE{HEADLINE_HORIZON}"
+    for source_name, per_sample in (
+        ("model", model_per_sample),
+        ("const-vel", baseline_per_sample),
+    ):
+        lines.append("")
+        lines.append(f"{headline} distribution — {source_name}")
+        lines.append(
+            f"{'slice':<14}{'n':>7}" + "".join(f"{name:>10}" for name in TAIL_HEADINGS)
+        )
+        for name, selected in selections:
+            lines.append(_tail_row(name, int(selected.sum()), per_sample[headline][selected]))
     return "\n".join(lines)
