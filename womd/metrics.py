@@ -89,6 +89,18 @@ def evaluate_predictions(
     )
 
 
+def breaches(pinned, measured, relative_tolerance):
+    found = {}
+    for name, pinned_value in pinned.items():
+        if name not in measured:
+            found[name] = (pinned_value, None)
+            continue
+        allowed = abs(pinned_value) * relative_tolerance
+        if abs(measured[name] - pinned_value) > allowed:
+            found[name] = (pinned_value, measured[name])
+    return found
+
+
 class MetricAccumulator:
     def __init__(self):
         self.totals = {}

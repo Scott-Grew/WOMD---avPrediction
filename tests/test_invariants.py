@@ -330,6 +330,20 @@ def test_kinematics_match_circular_arc_geometry():
     assert np.isclose(quantities["yaw_rate"][moving].mean().item(), angular_rate, atol=1e-3)
 
 
+def test_pinned_gate_fires_on_a_perturbation_larger_than_its_band():
+    pinned = {"model.minADE@8s": 0.680, "model.minFDE@8s": 1.581}
+    tolerance = 0.05
+
+    inside = {name: value * (1.0 + tolerance * 0.8) for name, value in pinned.items()}
+    assert metrics.breaches(pinned, inside, tolerance) == {}
+
+    outside = {name: value * (1.0 + tolerance * 1.2) for name, value in pinned.items()}
+    assert set(metrics.breaches(pinned, outside, tolerance)) == set(pinned)
+
+    dropped = {"model.minADE@8s": pinned["model.minADE@8s"]}
+    assert set(metrics.breaches(pinned, dropped, tolerance)) == {"model.minFDE@8s"}
+
+
 def _map_batch(polylines):
     tensor = torch.zeros(
         1, contract.MAX_MAP_POLYLINES, contract.POINTS_PER_POLYLINE, contract.MAP_FEATURE_DIM
