@@ -10,6 +10,7 @@ from womd import (
     dataset,
     features,
     frame,
+    kinematics,
     loss,
     metrics,
     model,
@@ -312,3 +313,23 @@ def test_batched_inference_beats_single_sample_per_sample_cost(synthetic_batch):
     predictor = model.MotionPredictor()
     measurements = report.measure_latency(predictor, synthetic_batch, repeats=3)
     assert measurements["single_sample_ms"] >= measurements["batched_per_sample_ms"]
+
+
+def test_kinematics_match_circular_arc_geometry():
+    radius, speed = 100.0, 10.0
+    angular_rate = speed / radius
+    elapsed = torch.arange(contract.FUTURE_STEPS) * kinematics.STEP_SECONDS
+    arc = torch.stack(
+        [radius * torch.sin(angular_rate * elapsed), radius * (1 - torch.cos(angular_rate * elapsed))],
+        dim=-1,
+    ).unsqueeze(0).unsqueeze(0)
+
+    quantities, moving = kinematics.motion_quantities(arc, window_steps=1)
+    assert np.isclose(quantities["lateral"][moving].mean().item(), speed**2 / radius, atol=1e-3)
+    assert np.isclose(quantities["yaw_rate"][moving].mean().item(), angular_rate, atol=1e-3)
+
+
+def test_constant_velocity_predictions_are_never_implausible(synthetic_batch):
+    rates = kinematics.violation_rates(baseline.constant_velocity_predictions(synthetic_batch))
+    for name, values in rates.items():
+        assert values.max().item() == 0.0, name

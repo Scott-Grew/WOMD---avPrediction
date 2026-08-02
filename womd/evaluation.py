@@ -1,6 +1,6 @@
 import torch
 
-from womd import baseline, metrics, report
+from womd import baseline, kinematics, metrics, report
 
 
 def _move_batch(batch, device):
@@ -19,14 +19,15 @@ def collect_per_sample(predictor, dataloader, device):
     for batch in dataloader:
         batch = _move_batch(batch, device)
         trajectories, _ = predictor(batch)
+        baseline_trajectories = baseline.constant_velocity_predictions(batch)
         model_values = metrics.per_sample_metrics(
             trajectories, batch["future_positions"], batch["future_mask"]
         )
+        model_values.update(kinematics.violation_rates(trajectories))
         baseline_values = metrics.per_sample_metrics(
-            baseline.constant_velocity_predictions(batch),
-            batch["future_positions"],
-            batch["future_mask"],
+            baseline_trajectories, batch["future_positions"], batch["future_mask"]
         )
+        baseline_values.update(kinematics.violation_rates(baseline_trajectories))
         labels = report.slice_labels(batch)
         for collected, produced in (
             (model_batches, model_values),

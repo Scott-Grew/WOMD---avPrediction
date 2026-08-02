@@ -170,6 +170,28 @@ def render(model_per_sample, baseline_per_sample, labels=None, columns=None):
                 )
             )
 
+    plausibility = [name for name in model_per_sample if name.startswith("implausible_")]
+    if plausibility:
+        lines.append("")
+        lines.append("share of predicted steps exceeding measured vehicle limits")
+        lines.append(
+            f"{'slice':<14}{'n':>7}"
+            + "".join(f"{name.replace('implausible_', ''):>20}" for name in plausibility)
+        )
+        lines.append(
+            " " * 21 + "".join(f"{'model':>10}{'const-vel':>10}" for _ in plausibility)
+        )
+        for name, selected in selections:
+            lines.append(
+                _row(
+                    name,
+                    int(selected.sum()),
+                    _reduce(model_per_sample, selected),
+                    _reduce(baseline_per_sample, selected),
+                    plausibility,
+                )
+            )
+
     headline = f"minADE{HEADLINE_HORIZON}"
     for source_name, per_sample in (
         ("model", model_per_sample),

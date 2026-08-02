@@ -55,6 +55,8 @@ def per_sample_metrics(
 
 
 def endpoint_presence_key(name):
+    if "@" not in name:
+        return None
     return f"{ENDPOINT_PRESENT_PREFIX}@{name.split('@')[1]}"
 
 
@@ -63,10 +65,11 @@ def reduce_per_sample(per_sample):
     for name, values in per_sample.items():
         if name.startswith(ENDPOINT_PRESENT_PREFIX):
             continue
-        if name.startswith("minADE"):
+        presence_key = endpoint_presence_key(name)
+        if name.startswith("minADE") or presence_key not in per_sample:
             results[name] = values.mean().item()
             continue
-        present = per_sample[endpoint_presence_key(name)]
+        present = per_sample[presence_key]
         present_count = present.sum().clamp(min=1)
         results[name] = (values * present).sum().item() / present_count.item()
     return results
