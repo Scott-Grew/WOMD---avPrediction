@@ -1,46 +1,62 @@
 import torch
 
-from womd import baseline, metrics
+from womd import baseline, metrics, report
 
 
 def _move_batch(batch, device):
     return {name: value.to(device) for name, value in batch.items()}
 
 
+def _concatenate(collected):
+    return {name: torch.cat(values) for name, values in collected.items()}
+
+
 @torch.no_grad()
-def evaluate_dataloader(predictor, dataloader, device):
+def collect_per_sample(predictor, dataloader, device):
     predictor.eval()
-    model_accumulator = metrics.MetricAccumulator()
-    baseline_accumulator = metrics.MetricAccumulator()
+    model_batches, baseline_batches, label_batches = {}, {}, {}
 
     for batch in dataloader:
         batch = _move_batch(batch, device)
-        batch_size = batch["future_positions"].shape[0]
         trajectories, _ = predictor(batch)
-        model_accumulator.update(
-            metrics.evaluate_predictions(
-                trajectories, batch["future_positions"], batch["future_mask"]
-            ),
-            batch_size,
+        model_values = metrics.per_sample_metrics(
+            trajectories, batch["future_positions"], batch["future_mask"]
         )
-        baseline_accumulator.update(
-            metrics.evaluate_predictions(
-                baseline.constant_velocity_predictions(batch),
-                batch["future_positions"],
-                batch["future_mask"],
-            ),
-            batch_size,
+        baseline_values = metrics.per_sample_metrics(
+            baseline.constant_velocity_predictions(batch),
+            batch["future_positions"],
+            batch["future_mask"],
         )
-    return model_accumulator.summary(), baseline_accumulator.summary()
+        labels = report.slice_labels(batch)
+        for collected, produced in (
+            (model_batches, model_values),
+            (baseline_batches, baseline_values),
+            (label_batches, labels),
+        ):
+            for name, values in produced.items():
+                collected.setdefault(name, []).append(values.cpu())
+
+    return (
+        _concatenate(model_batches),
+        _concatenate(baseline_batches),
+        _concatenate(label_batches),
+    )
 
 
-def format_comparison(model_results, baseline_results):
-    lines = [f"{'metric':<18}{'model':>12}{'constant-vel':>16}{'delta':>12}"]
-    for name in model_results:
-        model_value = model_results[name]
-        baseline_value = baseline_results[name]
-        lines.append(
-            f"{name:<18}{model_value:>12.3f}{baseline_value:>16.3f}"
-            f"{baseline_value - model_value:>12.3f}"
-        )
-    return "\n".join(lines)
+def evaluate_dataloader(predictor, dataloader, device):
+    model_per_sample, baseline_per_sample, _ = collect_per_sample(
+        predictor, dataloader, device
+    )
+    return (
+        metrics.reduce_per_sample(model_per_sample),
+        metrics.reduce_per_sample(baseline_per_sample),
+    )
+
+
+def render_dataloader_report(predictor, dataloader, device, sliced=True):
+    model_per_sample, baseline_per_sample, labels = collect_per_sample(
+        predictor, dataloader, device
+    )
+    return report.render(
+        model_per_sample, baseline_per_sample, labels if sliced else None
+    )

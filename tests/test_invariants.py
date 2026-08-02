@@ -4,7 +4,19 @@ import numpy as np
 import pytest
 import torch
 
-from womd import baseline, contract, dataset, features, frame, loss, metrics, model, synthetic, tfrecord
+from womd import (
+    baseline,
+    contract,
+    dataset,
+    features,
+    frame,
+    loss,
+    metrics,
+    model,
+    report,
+    synthetic,
+    tfrecord,
+)
 
 
 @pytest.fixture(scope="module")
@@ -261,3 +273,25 @@ def test_minimum_average_displacement_respects_gaps_in_the_future_mask():
         trajectories, future_positions, future_mask, steps
     )
     assert torch.allclose(error, torch.zeros(1), atol=1e-6)
+
+
+def test_per_sample_minimum_average_displacement_equals_a_constant_offset():
+    offset = 2.5
+    steps = contract.FUTURE_STEPS
+    future_positions = torch.randn(7, steps, 2)
+    future_mask = torch.ones(7, steps, dtype=torch.bool)
+    trajectories = future_positions.unsqueeze(1).repeat(1, contract.NUM_PREDICTED_MODES, 1, 1)
+    trajectories[..., 0] += offset
+
+    per_sample = metrics.per_sample_metrics(trajectories, future_positions, future_mask)
+    assert torch.allclose(
+        per_sample[f"minADE@{steps / 10:g}s"], torch.full((7,), offset), atol=1e-5
+    )
+
+
+def test_report_slices_partition_every_sample(synthetic_batch):
+    labels = report.slice_labels(synthetic_batch)
+    sample_count = synthetic_batch["future_positions"].shape[0]
+    for name, names in report.SLICE_NAMES.items():
+        counts = [int((labels[name] == value).sum()) for value in range(len(names))]
+        assert sum(counts) == sample_count

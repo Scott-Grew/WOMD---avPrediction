@@ -29,12 +29,9 @@ def main():
     checkpoint = torch.load(arguments.checkpoint, map_location=device)
     predictor.load_state_dict(checkpoint["model_state"])
 
-    model_results, baseline_results = evaluation.evaluate_dataloader(
-        predictor, dataloader, device
-    )
     print(f"samples {len(dataloader.dataset)} · checkpoint {arguments.checkpoint}")
     print()
-    print(evaluation.format_comparison(model_results, baseline_results))
+    print(evaluation.render_dataloader_report(predictor, dataloader, device))
 
 
 if __name__ == "__main__":

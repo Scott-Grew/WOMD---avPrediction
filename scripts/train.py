@@ -128,12 +128,9 @@ def main():
     print(f"device {device} · parameters {parameter_count:,}", flush=True)
 
     if start_epoch >= arguments.epochs:
-        model_results, baseline_results = evaluation.evaluate_dataloader(
-            predictor, validation_loader, device
-        )
         print(f"already trained {start_epoch} epochs, nothing to do", flush=True)
         print()
-        print(evaluation.format_comparison(model_results, baseline_results))
+        print(evaluation.render_dataloader_report(predictor, validation_loader, device))
         return
 
     best_score = float("inf")
@@ -181,7 +178,7 @@ def main():
             save_checkpoint(arguments.checkpoint, predictor, optimizer, epoch + 1)
 
     print()
-    print(evaluation.format_comparison(model_results, baseline_results))
+    print(evaluation.render_dataloader_report(predictor, validation_loader, device))
 
 
 if __name__ == "__main__":

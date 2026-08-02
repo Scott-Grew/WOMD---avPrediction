@@ -28,14 +28,17 @@ def minimum_final_displacement(trajectories, future_positions, future_mask, hori
     return minimum, present
 
 
-def evaluate_predictions(
+ENDPOINT_PRESENT_PREFIX = "endpointPresent"
+
+
+def per_sample_metrics(
     trajectories,
     future_positions,
     future_mask,
     horizons=contract.EVALUATED_HORIZON_STEPS,
     miss_threshold=contract.MISS_RATE_THRESHOLD_METRES,
 ):
-    results = {}
+    per_sample = {}
     for horizon_steps in horizons:
         seconds = horizon_steps / 10.0
         average = minimum_average_displacement(
@@ -44,15 +47,43 @@ def evaluate_predictions(
         final, final_present = minimum_final_displacement(
             trajectories, future_positions, future_mask, horizon_steps
         )
-        present_count = final_present.sum().clamp(min=1)
-        results[f"minADE@{seconds:g}s"] = average.mean().item()
-        results[f"minFDE@{seconds:g}s"] = (
-            final * final_present
-        ).sum().item() / present_count.item()
-        results[f"missRate@{seconds:g}s"] = (
-            ((final > miss_threshold) & final_present).sum().item() / present_count.item()
-        )
+        per_sample[f"minADE@{seconds:g}s"] = average
+        per_sample[f"minFDE@{seconds:g}s"] = final
+        per_sample[f"missRate@{seconds:g}s"] = (final > miss_threshold).to(final.dtype)
+        per_sample[f"{ENDPOINT_PRESENT_PREFIX}@{seconds:g}s"] = final_present
+    return per_sample
+
+
+def endpoint_presence_key(name):
+    return f"{ENDPOINT_PRESENT_PREFIX}@{name.split('@')[1]}"
+
+
+def reduce_per_sample(per_sample):
+    results = {}
+    for name, values in per_sample.items():
+        if name.startswith(ENDPOINT_PRESENT_PREFIX):
+            continue
+        if name.startswith("minADE"):
+            results[name] = values.mean().item()
+            continue
+        present = per_sample[endpoint_presence_key(name)]
+        present_count = present.sum().clamp(min=1)
+        results[name] = (values * present).sum().item() / present_count.item()
     return results
+
+
+def evaluate_predictions(
+    trajectories,
+    future_positions,
+    future_mask,
+    horizons=contract.EVALUATED_HORIZON_STEPS,
+    miss_threshold=contract.MISS_RATE_THRESHOLD_METRES,
+):
+    return reduce_per_sample(
+        per_sample_metrics(
+            trajectories, future_positions, future_mask, horizons, miss_threshold
+        )
+    )
 
 
 class MetricAccumulator:
