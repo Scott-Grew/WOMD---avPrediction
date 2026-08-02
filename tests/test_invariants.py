@@ -305,3 +305,10 @@ def test_tail_statistics_match_the_analytic_order_statistics():
     assert np.isclose(p95, 94.05, atol=1e-4)
     assert np.isclose(p99, 98.01, atol=1e-4)
     assert np.isclose(maximum, 99.0, atol=1e-6)
+
+
+def test_batched_inference_beats_single_sample_per_sample_cost(synthetic_batch):
+    torch.manual_seed(0)
+    predictor = model.MotionPredictor()
+    measurements = report.measure_latency(predictor, synthetic_batch, repeats=3)
+    assert measurements["single_sample_ms"] >= measurements["batched_per_sample_ms"]

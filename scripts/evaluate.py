@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from womd import dataset, evaluation, model
+from womd import dataset, evaluation, model, report
 
 
 def main():
@@ -32,6 +32,8 @@ def main():
     print(f"samples {len(dataloader.dataset)} · checkpoint {arguments.checkpoint}")
     print()
     print(evaluation.render_dataloader_report(predictor, dataloader, device))
+    print()
+    print(report.render_latency(report.measure_latency(predictor, next(iter(dataloader)))))
 
 
 if __name__ == "__main__":

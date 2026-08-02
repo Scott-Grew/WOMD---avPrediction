@@ -1,3 +1,5 @@
+import time
+
 import torch
 
 from womd import contract, metrics
@@ -51,6 +53,45 @@ SLICE_NAMES = {
     "agent_type": contract.PREDICTED_OBJECT_TYPES,
     "manoeuvre": MANOEUVRE_NAMES,
 }
+
+
+LATENCY_WARMUP_REPEATS = 2
+
+
+def _time_forward(predictor, batch, repeats):
+    with torch.no_grad():
+        for _ in range(LATENCY_WARMUP_REPEATS):
+            predictor(batch)
+        started = time.perf_counter()
+        for _ in range(repeats):
+            predictor(batch)
+    return (time.perf_counter() - started) / repeats
+
+
+def measure_latency(predictor, batch, repeats=10):
+    predictor.eval()
+    batch_size = batch["future_positions"].shape[0]
+    single = {name: values[:1] for name, values in batch.items()}
+    batched_seconds = _time_forward(predictor, batch, repeats)
+    single_seconds = _time_forward(predictor, single, repeats)
+    return {
+        "batch_size": float(batch_size),
+        "batched_total_ms": batched_seconds * 1000.0,
+        "batched_per_sample_ms": batched_seconds * 1000.0 / batch_size,
+        "single_sample_ms": single_seconds * 1000.0,
+    }
+
+
+def render_latency(measurements):
+    return "\n".join(
+        [
+            "inference latency",
+            f"{'batch size':<26}{measurements['batch_size']:>10.0f}",
+            f"{'batched, whole batch':<26}{measurements['batched_total_ms']:>10.2f} ms",
+            f"{'batched, per sample':<26}{measurements['batched_per_sample_ms']:>10.3f} ms",
+            f"{'single sample':<26}{measurements['single_sample_ms']:>10.3f} ms",
+        ]
+    )
 
 
 def _reduce(per_sample, selected):
