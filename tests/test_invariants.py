@@ -221,12 +221,16 @@ def test_shard_local_sampler_visits_every_sample_exactly_once(tmp_path, syntheti
 
     loaded = dataset.ShardedSampleDataset(tmp_path)
     sampler = dataset.ShardLocalShuffleSampler(loaded, seed=11)
+    sampler.set_epoch(0)
     first_epoch = list(iter(sampler))
+    repeated_first_epoch = list(iter(sampler))
+    sampler.set_epoch(1)
     second_epoch = list(iter(sampler))
 
     assert sorted(first_epoch) == list(range(len(loaded)))
     assert sorted(second_epoch) == list(range(len(loaded)))
-    assert first_epoch != second_epoch
+    assert repeated_first_epoch == first_epoch
+    assert second_epoch != first_epoch
 
 
 def test_shard_round_trips_through_dataset(tmp_path, synthetic_scenario):
@@ -241,3 +245,19 @@ def test_shard_round_trips_through_dataset(tmp_path, synthetic_scenario):
     assert np.allclose(
         first["future_positions"].numpy(), samples[0]["future_positions"], atol=1e-6
     )
+
+
+def test_minimum_average_displacement_respects_gaps_in_the_future_mask():
+    steps = contract.FUTURE_STEPS
+    future_positions = torch.zeros(1, steps, 2)
+    future_positions[0, :, 0] = torch.arange(steps, dtype=torch.float32)
+    future_mask = torch.zeros(1, steps, dtype=torch.bool)
+    future_mask[0, ::2] = True
+
+    trajectories = future_positions.unsqueeze(1).clone()
+    trajectories[0, 0, ~future_mask[0], 0] += 1000.0
+
+    error = metrics.minimum_average_displacement(
+        trajectories, future_positions, future_mask, steps
+    )
+    assert torch.allclose(error, torch.zeros(1), atol=1e-6)

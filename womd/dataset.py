@@ -76,7 +76,6 @@ class ShardLocalShuffleSampler(Sampler):
     def __iter__(self):
         random_generator = np.random.default_rng(self.seed + self.epoch)
         shard_order = random_generator.permutation(len(self.shard_lengths))
-        self.epoch += 1
         for shard_index in shard_order:
             start = int(self.shard_offsets[shard_index])
             length = self.shard_lengths[shard_index]

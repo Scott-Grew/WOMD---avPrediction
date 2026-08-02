@@ -58,12 +58,12 @@ def _history_feature_block(track_arrays, frame_origin, frame_heading):
 
     block = np.zeros((contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32)
     present = valid[history_slice]
-    block[:, 0:2] = local_positions
-    block[:, 2] = np.cos(local_headings)
-    block[:, 3] = np.sin(local_headings)
-    block[:, 4:6] = local_velocities
-    block[:, 6:8] = extents[history_slice]
-    block[:, 8:] = type_encoding
+    block[:, contract.AGENT_POSITION] = local_positions
+    block[:, contract.AGENT_HEADING_COSINE] = np.cos(local_headings)
+    block[:, contract.AGENT_HEADING_SINE] = np.sin(local_headings)
+    block[:, contract.AGENT_VELOCITY] = local_velocities
+    block[:, contract.AGENT_EXTENT] = extents[history_slice]
+    block[:, contract.AGENT_TYPE] = type_encoding
     block[~present] = 0.0
     return block, present.copy()
 
@@ -100,12 +100,12 @@ def _polyline_feature_block(chunk_local, kind_index):
     )
     mask = np.zeros(contract.POINTS_PER_POLYLINE, dtype=bool)
     point_count = len(chunk_local)
-    block[:point_count, 0:2] = chunk_local
+    block[:point_count, contract.MAP_POSITION] = chunk_local
     if point_count > 1:
         directions = np.diff(chunk_local, axis=0)
-        block[: point_count - 1, 2:4] = directions
-        block[point_count - 1, 2:4] = directions[-1]
-    block[:point_count, 4 + kind_index] = 1.0
+        block[: point_count - 1, contract.MAP_DIRECTION] = directions
+        block[point_count - 1, contract.MAP_DIRECTION] = directions[-1]
+    block[:point_count, contract.MAP_KIND.start + kind_index] = 1.0
     mask[:point_count] = True
     return block, mask
 

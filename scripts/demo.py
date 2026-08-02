@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from womd import baseline, contract, dataset, model
+from womd import baseline, contract, dataset, metrics, model
 
 SURFACE = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
@@ -38,8 +38,8 @@ def draw_map(axes, polylines, polylines_mask):
     for polyline, mask in zip(polylines, polylines_mask):
         if not mask.any():
             continue
-        points = polyline[mask][:, 0:2]
-        kind_index = int(np.argmax(polyline[mask][0, 4:]))
+        points = polyline[mask][:, contract.MAP_POSITION]
+        kind_index = int(np.argmax(polyline[mask][0, contract.MAP_KIND]))
         kind = contract.MAP_POLYLINE_KINDS[kind_index]
         colour, width, style = MAP_KIND_STYLE[kind]
         if kind == "stop_sign":
@@ -54,7 +54,7 @@ def draw_neighbours(axes, neighbour_history, neighbour_mask):
     for history, mask in zip(neighbour_history, neighbour_mask):
         if not mask.any():
             continue
-        track = history[mask][:, 0:2]
+        track = history[mask][:, contract.AGENT_POSITION]
         axes.plot(track[:, 0], track[:, 1], color="#b4b3ac", linewidth=1.0, zorder=2)
         axes.scatter(
             track[-1, 0],
@@ -83,7 +83,9 @@ def render_scene(axes, sample, trajectories, mode_logits, baseline_trajectory, s
         axes, sample["neighbour_history"].numpy(), sample["neighbour_history_mask"].numpy()
     )
 
-    history = sample["agent_history"].numpy()[sample["agent_history_mask"].numpy()][:, 0:2]
+    history = sample["agent_history"].numpy()[sample["agent_history_mask"].numpy()][
+        :, contract.AGENT_POSITION
+    ]
     truth = sample["future_positions"].numpy()[sample["future_mask"].numpy()]
     probabilities = torch.softmax(mode_logits, dim=-1).numpy()
     ordering = np.argsort(-probabilities)
@@ -146,11 +148,20 @@ def render_scene(axes, sample, trajectories, mode_logits, baseline_trajectory, s
         0.0, 0.0, s=70, color=INK_PRIMARY, edgecolors=SURFACE, linewidths=1.6, zorder=9
     )
 
+    future_positions = sample["future_positions"].unsqueeze(0)
+    future_mask = sample["future_mask"].unsqueeze(0)
     best_error = float(
-        np.linalg.norm(trajectories.numpy()[:, : len(truth)] - truth, axis=-1).mean(axis=-1).min()
+        metrics.minimum_average_displacement(
+            trajectories.unsqueeze(0), future_positions, future_mask, contract.FUTURE_STEPS
+        )[0]
     )
     baseline_error = float(
-        np.linalg.norm(baseline_trajectory[: len(truth)] - truth, axis=-1).mean()
+        metrics.minimum_average_displacement(
+            torch.from_numpy(baseline_trajectory).unsqueeze(0).unsqueeze(0),
+            future_positions,
+            future_mask,
+            contract.FUTURE_STEPS,
+        )[0]
     )
     axes.annotate(
         f"minADE {best_error:.2f} m   ·   baseline {baseline_error:.2f} m",

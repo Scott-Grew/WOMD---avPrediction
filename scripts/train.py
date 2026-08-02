@@ -17,6 +17,11 @@ def select_device(requested):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def checkpoint_variant_path(path, variant):
+    base = pathlib.Path(path)
+    return base.with_name(f"{base.stem}.{variant}{base.suffix}")
+
+
 def save_checkpoint(path, predictor, optimizer, epoch):
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -122,8 +127,25 @@ def main():
     parameter_count = sum(p.numel() for p in predictor.parameters())
     print(f"device {device} · parameters {parameter_count:,}", flush=True)
 
+    if start_epoch >= arguments.epochs:
+        model_results, baseline_results = evaluation.evaluate_dataloader(
+            predictor, validation_loader, device
+        )
+        print(f"already trained {start_epoch} epochs, nothing to do", flush=True)
+        print()
+        print(evaluation.format_comparison(model_results, baseline_results))
+        return
+
+    best_score = float("inf")
+    if arguments.resume:
+        resumed_results, _ = evaluation.evaluate_dataloader(
+            predictor, validation_loader, device
+        )
+        best_score = resumed_results["minADE@8s"]
+
     for epoch in range(start_epoch, arguments.epochs):
         started = time.time()
+        train_sampler.set_epoch(epoch)
         trained_mode_count = trained_mode_count_for_epoch(
             epoch, arguments.epochs, arguments.ewta_start_modes
         )
@@ -139,14 +161,24 @@ def main():
             predictor, validation_loader, device
         )
         elapsed = time.time() - started
+        score = model_results["minADE@8s"]
+        improved = score < best_score
         print(
             f"epoch {epoch + 1}/{arguments.epochs} · modes {trained_mode_count} · "
             f"loss {average_loss:.4f} · "
-            f"minADE@8s {model_results['minADE@8s']:.3f} · "
+            f"minADE@8s {score:.3f}{' *best' if improved else ''} · "
             f"baseline {baseline_results['minADE@8s']:.3f} · {elapsed:.1f}s",
             flush=True,
         )
-        save_checkpoint(arguments.checkpoint, predictor, optimizer, epoch + 1)
+        save_checkpoint(
+            checkpoint_variant_path(arguments.checkpoint, "last"),
+            predictor,
+            optimizer,
+            epoch + 1,
+        )
+        if improved:
+            best_score = score
+            save_checkpoint(arguments.checkpoint, predictor, optimizer, epoch + 1)
 
     print()
     print(evaluation.format_comparison(model_results, baseline_results))
