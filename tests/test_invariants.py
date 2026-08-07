@@ -119,6 +119,18 @@ def test_v3_futures_map_back_to_logged_world_positions(synthetic_scenario):
         assert np.allclose(world[future_index], (logged.center_x, logged.center_y), atol=1e-3)
 
 
+def test_constant_turn_rate_reduces_to_constant_velocity_when_straight(synthetic_batch):
+    straight_batch = {name: value.clone() for name, value in synthetic_batch.items()}
+    straight_batch["agent_history"][:, :, contract.AGENT_HEADING_COSINE] = 1.0
+    straight_batch["agent_history"][:, :, contract.AGENT_HEADING_SINE] = 0.0
+    straight_batch["agent_history"][:, :, contract.AGENT_VELOCITY][..., 1] = 0.0
+
+    turning = baseline.constant_turn_rate_predictions(straight_batch)
+    velocity = baseline.constant_velocity_predictions(straight_batch)
+    assert torch.isfinite(turning).all()
+    assert torch.allclose(turning, velocity, atol=1e-4)
+
+
 def test_v4_baseline_and_model_share_the_evaluation_path(synthetic_batch):
     torch.manual_seed(0)
     predictor = model.MotionPredictor()
