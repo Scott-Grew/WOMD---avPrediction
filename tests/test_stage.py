@@ -70,7 +70,7 @@ def stage_fixture(tmp_path):
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
-    written_paths = stage.stage_shards([shard_path], output_directory)
+    written_paths, _ = stage.stage_shards([shard_path], output_directory)
     return np.load(written_paths[0])
 
 
@@ -97,10 +97,11 @@ def test_staging_names_by_scenario_id_across_production_shards(tmp_path):
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
 
-    written_paths = stage.stage_shards([first_shard, second_shard], output_directory)
+    written_paths, spacing_deviations = stage.stage_shards([first_shard, second_shard], output_directory)
 
     assert sorted(path.name for path in written_paths) == ["aaa111.npz", "bbb222.npz", "ccc333.npz"]
     assert all(path.exists() for path in written_paths)
+    assert len(spacing_deviations) == len(written_paths)
 
 
 def test_collision_guard_dies_on_duplicate_scenario_ids(tmp_path):

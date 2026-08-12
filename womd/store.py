@@ -289,14 +289,15 @@ def scenario_map_arrays(scenario):
     return map_rows, feature_lengths
 
 ## Write boundary: one scenario -> one .npz on disk. Float32 cast + compression live here and only here.
+# Returns the scenario's worst timestep-spacing deviation from 0.1 s. Measured on real data:
+# ~3% of scenarios have one skipped frame (gap ~0.2 s) or start-of-recording jitter, and Waymo
+# scores them like any other, so irregular spacing is COUNTED by the caller, never a veto.
 def write_scenario(scenario, output_path):
     assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
         f"current_time_index {scenario.current_time_index}, scenario {scenario.scenario_id}"
     )
     timestamp_gaps = np.diff(np.array(scenario.timestamps_seconds))
-    assert np.all(np.abs(timestamp_gaps - 0.1) < 0.005), (
-        f"irregular timestep spacing, scenario {scenario.scenario_id}"
-    )
+    worst_spacing_deviation = float(np.max(np.abs(timestamp_gaps - 0.1))) if len(timestamp_gaps) else 0.0
     track_rows, track_valid = scenario_track_arrays(scenario)
     track_ids, is_designated_target, is_object_of_interest = scenario_track_labels(scenario)
     map_rows, feature_lengths = scenario_map_arrays(scenario)
@@ -315,3 +316,4 @@ def write_scenario(scenario, output_path):
         frame_heading=np.float32(heading),
         scenario_id=scenario.scenario_id,
     )
+    return worst_spacing_deviation
