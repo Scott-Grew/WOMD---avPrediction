@@ -14,6 +14,7 @@ NUM_AGENT_TYPES = len(AGENT_TYPES)
 STAGING_CROP_RADIUS_METRES = 250.0              # VERIFY: Staging time constant: max travel scenario 133m, store.py disk writing governer.
 MAP_POINT_SPACING_METRES = 0.5
 NUM_PREDICTED_MODES = 6                         # Mode = possible future. We predict X futures. WOMD caps submissions at 6. Prune from X.
+STAGING_CODE_VERSION = "2026-08-11-a"           # Bumped by hand on every code-dataset upload. kaggle_preflight compares working copy vs mount.
 
 AGENT_POSITION = slice(0, 2)
 AGENT_HEADING_COSINE = 2
@@ -103,4 +104,5 @@ BOUNDARY_TYPES = ROAD_LINE_TYPES + ROAD_EDGE_TYPES
 NUM_BOUNDARY_TYPES = len(BOUNDARY_TYPES)
 
 MAP_BOUNDARY_TYPE = slice(MAP_SPEED_LIMIT + 1, MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES)
-MAP_FEATURE_DIM = MAP_BOUNDARY_TYPE.stop
+MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
+MAP_FEATURE_DIM = MAP_STOP_POINT.stop

@@ -54,6 +54,8 @@ def build_fixture_scenario(scenario_id):
     lane_state = scenario.dynamic_map_states.add().lane_states.add()
     lane_state.lane = 7
     lane_state.state = map_pb2.TrafficSignalLaneState.LANE_STATE_GO
+    lane_state.stop_point.x = 9.0
+    lane_state.stop_point.y = 1.0
     return scenario
 
 

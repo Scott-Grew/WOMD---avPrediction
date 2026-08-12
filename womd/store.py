@@ -169,10 +169,13 @@ def map_feature_to_storage_frame(feature, origin, heading):
     keep = np.linalg.norm(stored_points, axis=1) <= contract.STAGING_CROP_RADIUS_METRES
     return stored_points[keep], stored_arrows[keep], kind_index
 
-# Traffic signal look-up/define: 1 second history -> now 
+# Traffic signal look-up/define: 1 second history -> now
 # Hotspot approach , 11(timestamp) x 9(state)
+# Also collects each signal's stop point (world frame, first sighting wins) - the spot on the
+# lane where vehicles must halt when the light says stop.
 def scenario_traffic_signal_histories(scenario):
     histories = {}
+    stop_points = {}
     for step_index, dynamic_state in enumerate(scenario.dynamic_map_states[:contract.HISTORY_STEPS]):
         for lane_state in dynamic_state.lane_states:
             state_name = map_pb2.TrafficSignalLaneState.State.Name(lane_state.state)
@@ -181,10 +184,14 @@ def scenario_traffic_signal_histories(scenario):
                 np.zeros((contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)),
             )
             history[step_index, contract.TRAFFIC_SIGNAL_STATES.index(state_name)] = 1.0
-    return histories
+            stop_points.setdefault(
+                lane_state.lane,
+                np.array([lane_state.stop_point.x, lane_state.stop_point.y]),
+            )
+    return histories, stop_points
 
-# FLAG: # Joins everything built above into one finished N x 127 table for a single feature: geometry in every row, 
-#   kind one-hot, then the detail blocks only that kind fills (lane -> signals/type/speed, line/edge -> boundary type).
+# FLAG: # Joins everything built above into one finished N x 129 table for a single feature: geometry in every row,
+#   kind one-hot, then the detail blocks only that kind fills (lane -> signals/type/speed/stop point, line/edge -> boundary type).
 # N (dots per feature) stays ragged on purpose: staging stores the world complete; the loader crops/rotates per 
 #   predicted agent at train time, where the choice costs a flag instead of a restage.
 # One scenario map per stageing, prev one per sample. Map - about 85% sample data. Current cut 1/3 map storage from per sample.
@@ -192,32 +199,34 @@ def scenario_traffic_signal_histories(scenario):
 # The scenario is the unit of storage; the sample is the unit of training
 #   WOMD Leaderboard asks for 8.
 #
-# The final matrix — map_rows (N_total, 127), one contiguous block of rows per feature:
+# The final matrix — map_rows (N_total, 129), one contiguous block of rows per feature:
 #
-#                   0  1   2  3    4 .. 10   11 ................ 109   110-113   114   115 .. 123  124-126
-#                ┌───────┬───────┬─────────┬─────────────────────────┬─────────┬─────┬─────────────────────┐
-#                │  POS  │  DIR  │  KIND   │      SIGNAL_STATE       │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │
-#                │  x  y │ dx dy │1-hot of7│ 11 steps x 9 states     │1-hot of4│ mph │ 9 road_line│3 r_edge│
-#                ├───────┼───────┼─────────┼─────────────────────────┼─────────┼─────┼────────────┼────────┤
-# lane           │  x  y │ dx dy │  1 @ 4  │ (11x9) 1-hot history *  │  1-hot  │ mph │     0      │   0    │
-# road_line      │  x  y │ dx dy │  1 @ 5  │            0            │    0    │  0  │ 1-hot of 9 │   0    │
-# road_edge      │  x  y │ dx dy │  1 @ 6  │            0            │    0    │  0  │     0      │1-hot/3 │
-# stop_sign      │  x  y │  0  0 │  1 @ 7  │            0            │    0    │  0  │     0      │   0    │
-# crosswalk      │  x  y │ dx dy │  1 @ 8  │            0            │    0    │  0  │     0      │   0    │
-# speed_bump     │  x  y │ dx dy │  1 @ 9  │            0            │    0    │  0  │     0      │   0    │
-# driveway       │  x  y │ dx dy │ 1 @ 10  │            0            │    0    │  0  │     0      │   0    │
-#                │   :   │   :   │    :    │            :            │    :    │  :  │     :      │   :    │
-#                └───────┴───────┴─────────┴─────────────────────────┴─────────┴─────┴────────────┴────────┘
+#                   0  1   2  3    4 .. 10   11 ................ 109   110-113   114   115 .. 123  124-126  127-128
+#                ┌───────┬───────┬─────────┬─────────────────────────┬─────────┬─────┬─────────────────────┬───────┐
+#                │  POS  │  DIR  │  KIND   │      SIGNAL_STATE       │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │ STOP  │
+#                │  x  y │ dx dy │1-hot of7│ 11 steps x 9 states     │1-hot of4│ mph │ 9 road_line│3 r_edge│ sx sy │
+#                ├───────┼───────┼─────────┼─────────────────────────┼─────────┼─────┼────────────┼────────┼───────┤
+# lane           │  x  y │ dx dy │  1 @ 4  │ (11x9) 1-hot history *  │  1-hot  │ mph │     0      │   0    │ sx sy │
+# road_line      │  x  y │ dx dy │  1 @ 5  │            0            │    0    │  0  │ 1-hot of 9 │   0    │  0 0  │
+# road_edge      │  x  y │ dx dy │  1 @ 6  │            0            │    0    │  0  │     0      │1-hot/3 │  0 0  │
+# stop_sign      │  x  y │  0  0 │  1 @ 7  │            0            │    0    │  0  │     0      │   0    │  0 0  │
+# crosswalk      │  x  y │ dx dy │  1 @ 8  │            0            │    0    │  0  │     0      │   0    │  0 0  │
+# speed_bump     │  x  y │ dx dy │  1 @ 9  │            0            │    0    │  0  │     0      │   0    │  0 0  │
+# driveway       │  x  y │ dx dy │ 1 @ 10  │            0            │    0    │  0  │     0      │   0    │  0 0  │
+#                │   :   │   :   │    :    │            :            │    :    │  :  │     :      │   :    │   :   │
+#                └───────┴───────┴─────────┴─────────────────────────┴─────────┴─────┴────────────┴────────┴───────┘
 #                  ↑ one row = one 0.5 m dot
 #
 # Rows: features stay contiguous in scenario.map_features order (kinds interleave — one band per
 #   kind shown once). Block i has feature_lengths[i] rows; boundaries = cumsum(feature_lengths).
-# * SIGNAL [11:110] (99 of 127 cols): signalised lanes only, else zeros. Step-major:
+# * SIGNAL [11:110] (99 of 129 cols): signalised lanes only, else zeros. Step-major:
 #   [11:20]=t-10 ... [101:110]=now. Within each 9-wide step: 0 UNKNOWN, 1 ARROW_STOP,
 #   2 ARROW_CAUTION, 3 ARROW_GO, 4 STOP, 5 CAUTION, 6 GO, 7 FLASHING_STOP, 8 FLASHING_CAUTION.
 # KIND hot column = 4 + kind index, in MAP_POLYLINE_KINDS order. stop_sign is a single dot -> DIR 0,0.
-# Column widths not to scale: SIGNAL alone is 78% of the row.
-def map_feature_rows(feature, origin, heading, signal_histories):
+# STOP [127:129]: signalised lanes only — the signal's stop point in the storage frame, same pair
+#   on every dot of that lane; zeros everywhere else (an unsignalled lane has no stop point).
+# Column widths not to scale: SIGNAL alone is 77% of the row.
+def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points):
     stored_points, stored_arrows, kind_index = map_feature_to_storage_frame(feature, origin, heading)
     if stored_points is None or len(stored_points) == 0:
         return None
@@ -231,6 +240,9 @@ def map_feature_rows(feature, origin, heading, signal_histories):
     if kind == "lane":
         if feature.id in signal_histories:
             rows[:, contract.MAP_SIGNAL_STATE] = signal_histories[feature.id].reshape(-1)
+            rows[:, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(
+                signal_stop_points[feature.id], origin, heading
+            )
         assert feature.lane.type < contract.NUM_LANE_TYPES
         rows[:, contract.MAP_LANE_TYPE.start + feature.lane.type] = 1.0
         rows[:, contract.MAP_SPEED_LIMIT] = feature.lane.speed_limit_mph
@@ -245,7 +257,7 @@ def map_feature_rows(feature, origin, heading, signal_histories):
 
 # Turns a whole scenario's map into one packed thing
 #
-# COMPLETED HERE — the map matrix, map_rows (N_total, 127): every feature's row-table from
+# COMPLETED HERE — the map matrix, map_rows (N_total, 129): every feature's row-table from
 #   map_feature_rows (diagram above), stacked top to bottom in scenario.map_features order.
 #   feature_lengths (F,) int64 records each block's height; cumsum recovers the boundaries.
 #
@@ -261,11 +273,11 @@ def map_feature_rows(feature, origin, heading, signal_histories):
 #   └───────────────┘
 def scenario_map_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
-    signal_histories = scenario_traffic_signal_histories(scenario)
+    signal_histories, signal_stop_points = scenario_traffic_signal_histories(scenario)
 
     feature_tables = []
     for feature in scenario.map_features:
-        rows = map_feature_rows(feature, origin, heading, signal_histories)
+        rows = map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points)
         if rows is not None:
             feature_tables.append(rows)
 
@@ -280,6 +292,10 @@ def scenario_map_arrays(scenario):
 def write_scenario(scenario, output_path):
     assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
         f"current_time_index {scenario.current_time_index}, scenario {scenario.scenario_id}"
+    )
+    timestamp_gaps = np.diff(np.array(scenario.timestamps_seconds))
+    assert np.all(np.abs(timestamp_gaps - 0.1) < 0.005), (
+        f"irregular timestep spacing, scenario {scenario.scenario_id}"
     )
     track_rows, track_valid = scenario_track_arrays(scenario)
     track_ids, is_designated_target, is_object_of_interest = scenario_track_labels(scenario)

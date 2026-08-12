@@ -49,9 +49,12 @@ def test_map_rows_layout_for_all_seven_kinds():
     lane_signal_history = np.zeros((contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES))
     lane_signal_history[:, 6] = 1.0
     signal_histories = {7: lane_signal_history}
+    signal_stop_points = {7: np.array([9.0, 1.0])}
 
     for kind_index, feature in enumerate(features):
-        rows = store.map_feature_rows(feature, WORLD_ORIGIN, WORLD_HEADING, signal_histories)
+        rows = store.map_feature_rows(
+            feature, WORLD_ORIGIN, WORLD_HEADING, signal_histories, signal_stop_points
+        )
         kind = contract.MAP_POLYLINE_KINDS[kind_index]
 
         assert rows is not None, kind
@@ -67,6 +70,7 @@ def test_map_rows_layout_for_all_seven_kinds():
             assert np.all(rows[:, contract.MAP_LANE_TYPE.start + 2] == 1.0)
             assert np.all(rows[:, contract.MAP_SPEED_LIMIT] == 45.0)
             assert np.all(rows[:, contract.MAP_BOUNDARY_TYPE] == 0.0)
+            assert np.all(rows[:, contract.MAP_STOP_POINT] == signal_stop_points[7])
         elif kind == "road_line":
             hot_columns = np.flatnonzero(detail_block.any(axis=0)) + contract.MAP_KIND.stop
             assert list(hot_columns) == [contract.MAP_BOUNDARY_TYPE.start + 2]
@@ -116,5 +120,5 @@ def test_crop_keeps_polyline_crossing_the_boundary():
 
 
 def test_feature_row_layout_is_pinned():
-    assert contract.MAP_FEATURE_DIM == 127
+    assert contract.MAP_FEATURE_DIM == 129
     assert contract.AGENT_FEATURE_DIM == 13
