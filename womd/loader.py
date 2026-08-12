@@ -32,7 +32,7 @@ def eligible_track_indices(track_rows, track_valid):
 # row. arctan2(sin, cos) recovers the angle from the stored pair - the recovery V6 guards.
 def sample_frame(track_rows, track_index):
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
-    origin = now_row[contract.AGENT_POSITION].astype(np.float64)
+    origin = now_row[contract.AGENT_POSITION]
     heading = np.arctan2(now_row[contract.AGENT_HEADING_SINE], now_row[contract.AGENT_HEADING_COSINE])
     return origin, heading
 
@@ -54,34 +54,23 @@ def track_rows_to_agent_frame(rows, origin, heading):
     reframed[..., contract.AGENT_HEADING_SINE] = heading_sine * rotation_cosine - heading_cosine * rotation_sine
     return reframed
 
-
-def map_rows_to_agent_frame(map_rows, origin, heading):
-    reframed = map_rows.copy()
-    reframed[:, contract.MAP_POSITION] = frame_ops.positions_to_agent_frame(
-        map_rows[:, contract.MAP_POSITION], origin, heading
-    )
-    reframed[:, contract.MAP_DIRECTION] = frame_ops.directions_to_agent_frame(
-        map_rows[:, contract.MAP_DIRECTION], heading
-    )
-    has_signal = map_rows[:, contract.MAP_SIGNAL_STATE].any(axis=1)
-    reframed[has_signal, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(
-        map_rows[has_signal, contract.MAP_STOP_POINT], origin, heading
-    )
+def crop_and_reframe_map(map_rows, origin, heading, speed):
+    agent_frame_positions = frame_ops.positions_to_agent_frame(map_rows[:, contract.MAP_POSITION], origin, heading)
+    crop_mask = inside_crop(agent_frame_positions, BASE_RADIUS_METRES, 1.0 + STRETCH_GAIN * speed)
+    reframed = map_rows[crop_mask]
+    reframed[:, contract.MAP_POSITION] = agent_frame_positions[crop_mask]
+    reframed[:, contract.MAP_DIRECTION] = frame_ops.directions_to_agent_frame(reframed[:, contract.MAP_DIRECTION], heading)
+    has_signal = reframed[:, contract.MAP_SIGNAL_STATE].any(axis=1)
+    reframed[has_signal, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(reframed[has_signal, contract.MAP_STOP_POINT], origin, heading)
     return reframed
 
+def read_scenario(scenario_path):
+    with np.load(scenario_path) as scenario_file:
+        return {name: scenario_file[name] for name in scenario_file.files}
 
-def crop_map(agent_frame_map_rows, speed):
-    crop_mask = inside_crop(
-        agent_frame_map_rows[:, contract.MAP_POSITION],
-        BASE_RADIUS_METRES,
-        1.0 + STRETCH_GAIN * speed,
-    )
-    return agent_frame_map_rows[crop_mask]
-
-
-def build_sample(scenario_file, track_index):
-    track_rows = scenario_file["track_rows"]
-    track_valid = scenario_file["track_valid"]
+def build_sample(scenario_array, track_index):
+    track_rows = scenario_array["track_rows"]
+    track_valid = scenario_array["track_valid"]
     origin, heading = sample_frame(track_rows, track_index)
 
     agent_track = track_rows_to_agent_frame(track_rows[track_index], origin, heading)
@@ -93,8 +82,8 @@ def build_sample(scenario_file, track_index):
     )
 
     speed = float(np.linalg.norm(track_rows[track_index, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY]))
-    agent_map = crop_map(map_rows_to_agent_frame(scenario_file["map_rows"], origin, heading), speed)
-
+    agent_map = crop_and_reframe_map(scenario_array["map_rows"], origin, heading, speed)
+    
     return {
         "agent_history": agent_track[:contract.HISTORY_STEPS],
         "agent_history_mask": track_valid[track_index, :contract.HISTORY_STEPS],
@@ -105,8 +94,39 @@ def build_sample(scenario_file, track_index):
         "map_rows": agent_map,
         "frame_origin": origin,
         "frame_heading": heading,
-        "scenario_id": scenario_file["scenario_id"],
-        "track_id": scenario_file["track_ids"][track_index],
-        "is_designated_target": scenario_file["is_designated_target"][track_index],
-        "is_object_of_interest": scenario_file["is_object_of_interest"][track_index],
+        "scenario_id": scenario_array["scenario_id"],
+        "track_id": scenario_array["track_ids"][track_index],
+        "is_designated_target": scenario_array["is_designated_target"][track_index],
+        "is_object_of_interest": scenario_array["is_object_of_interest"][track_index],
+    }
+
+def build_batch(samples):
+    batch_size = len(samples)
+    max_neighbours = max(sample["neighbour_history"].shape[0] for sample in samples)
+    max_map_rows = max(sample["map_rows"].shape[0] for sample in samples)
+
+    neighbour_history = np.zeros(
+        (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
+    )
+    neighbour_history_mask = np.zeros((batch_size, max_neighbours, contract.HISTORY_STEPS), dtype=bool)
+    map_rows = np.zeros((batch_size, max_map_rows, contract.MAP_FEATURE_DIM), dtype=np.float32)
+    map_row_mask = np.zeros((batch_size, max_map_rows), dtype=bool)
+
+    for sample_index, sample in enumerate(samples):
+        neighbour_count = sample["neighbour_history"].shape[0]
+        neighbour_history[sample_index, :neighbour_count] = sample["neighbour_history"]
+        neighbour_history_mask[sample_index, :neighbour_count] = sample["neighbour_history_mask"]
+        dot_count = sample["map_rows"].shape[0]
+        map_rows[sample_index, :dot_count] = sample["map_rows"]
+        map_row_mask[sample_index, :dot_count] = True
+
+    return {
+        "agent_history": np.stack([sample["agent_history"] for sample in samples]),
+        "agent_history_mask": np.stack([sample["agent_history_mask"] for sample in samples]),
+        "future_positions": np.stack([sample["future_positions"] for sample in samples]),
+        "future_mask": np.stack([sample["future_mask"] for sample in samples]),
+        "neighbour_history": neighbour_history,
+        "neighbour_history_mask": neighbour_history_mask,
+        "map_rows": map_rows,
+        "map_row_mask": map_row_mask,
     }
