@@ -13,6 +13,7 @@ from waymo_open_dataset.protos import map_pb2, scenario_pb2
 def scenario_storage_frame(scenario):
     sdc_track = scenario.tracks[scenario.sdc_track_index]
     sdc_state = sdc_track.states[contract.CURRENT_STEP_INDEX]
+    assert sdc_state.valid, f"invalid SDC at current step, scenario {scenario.scenario_id}"
     origin = np.array([sdc_state.center_x, sdc_state.center_y])
     heading = sdc_state.heading
     return origin, heading
@@ -30,15 +31,17 @@ def track_to_storage_frame(track, origin, heading):
 
     return stored_positions, stored_headings, stored_velocities, valid
 
-# FLAG: Takes in dynamic object and returns its 91(timestamps) x11(features) table
-def track_to_feature_rows(track, origin, heading):
+# FLAG: Takes in dynamic object and returns its 91(timestamps) x13(features) table
+def track_to_feature_rows(track, origin, heading, is_sdc):
     positions, headings, velocities, valid = track_to_storage_frame(track, origin, heading)
     dimensions = np.array([[state.length, state.width] for state in track.states])
 
     type_name = scenario_pb2.Track.ObjectType.Name(track.object_type)
-    type_onehot = np.zeros(contract.NUM_OBJECT_TYPES)
-    if type_name in contract.PREDICTED_OBJECT_TYPES:
-        type_onehot[contract.PREDICTED_OBJECT_TYPES.index(type_name)] = 1.0
+    type_onehot = np.zeros(contract.NUM_AGENT_TYPES)
+    if type_name in contract.AGENT_TYPES:
+        type_onehot[contract.AGENT_TYPES.index(type_name)] = 1.0
+    else:
+        type_onehot[contract.AGENT_TYPES.index("TYPE_OTHER")] = 1.0
     type_rows = np.tile(type_onehot, (contract.TOTAL_STEPS, 1))
 
     rows = np.zeros((contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM))
@@ -48,23 +51,60 @@ def track_to_feature_rows(track, origin, heading):
     rows[:, contract.AGENT_VELOCITY] = velocities
     rows[:, contract.AGENT_DIMENSIONS] = dimensions
     rows[:, contract.AGENT_TYPE] = type_rows
+    rows[:, contract.AGENT_IS_SDC] = 1.0 if is_sdc else 0.0
 
     return rows, valid
 
-# Creates a library of the all tracks (as tables) in the scenario: head -> table 91(timestamps) x11(features)
+# Creates a library of the all tracks (as tables) in the scenario: head -> table 91(timestamps) x13(features)
 # Similar to vector<Matrix> in C++
 # Scenatio is WOMD provided, defined in WOMD's world coordinates
+#
+# COMPLETED HERE — the agent tensor, track_rows (num_tracks, 91, 13): one 91x13 table per track,
+#   stacked in scenario.tracks order. Row = one 0.1 s step (0-9 history, 10 = now, 11-90 future).
+#   All geometry in the storage frame (SDC at origin facing +x at "now").
+#
+#                   0  1    2      3     4  5    6  7      8 ..... 11     12
+#                ┌───────┬──────┬──────┬───────┬───────┬────────────────┬─────┐
+#                │  POS  │ HCOS │ HSIN │  VEL  │ DIMS  │      TYPE      │ SDC │
+#                │  x  y │ cos0 │ sin0 │ vx vy │ ln wd │ veh ped cyc oth│ 0/1 │
+#                ├───────┼──────┼──────┼───────┼───────┼────────────────┼─────┤
+# SDC (vehicle)  │  x  y │  c   │  s   │ vx vy │ ln wd │  1   0   0   0 │  1  │
+# vehicle        │  x  y │  c   │  s   │ vx vy │ ln wd │  1   0   0   0 │  0  │
+# pedestrian     │  x  y │  c   │  s   │ vx vy │ ln wd │  0   1   0   0 │  0  │
+# cyclist        │  x  y │  c   │  s   │ vx vy │ ln wd │  0   0   1   0 │  0  │
+# TYPE_OTHER     │  x  y │  c   │  s   │ vx vy │ ln wd │  0   0   0   1 │  0  │
+#                └───────┴──────┴──────┴───────┴───────┴────────────────┴─────┘
+#                  ↑ one band per track kind shown once; the real axis is 91 timesteps deep
+#
+# COMPLETED HERE — the validity matrix, track_valid (num_tracks, 91) bool: cell [k, t] True iff
+#   track k was observed at step t. Rows align 1:1 with track_rows; a False cell means that
+#   timestep's feature row is zeros — zeros are padding, validity says so.
 def scenario_track_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
 
     all_rows = []
     all_valid = []
-    for track in scenario.tracks:
-        rows, valid = track_to_feature_rows(track, origin, heading)
+    for track_index, track in enumerate(scenario.tracks):
+        rows, valid = track_to_feature_rows(track, origin, heading, track_index 
+                                            == scenario.sdc_track_index)
         all_rows.append(rows)
         all_valid.append(valid)
 
     return np.stack(all_rows), np.stack(all_valid)
+
+# Builds three lists, one entry per agent in the scenario:
+#   1. What is this agent's ID number? (track_ids)
+#   2. Is this one of the agents Waymo grades us on? (is_designated_target — True/False)
+#   3. Did Waymo tag this agent as "doing something interesting"? (is_object_of_interest — True/False)
+def scenario_track_labels(scenario):
+    track_ids = np.array([track.id for track in scenario.tracks], dtype=np.int64)
+    designated_indices = {required.track_index for required in scenario.tracks_to_predict}
+    is_designated_target = np.array(
+        [track_index in designated_indices for track_index in range(len(scenario.tracks))]
+    )
+    interest_ids = set(scenario.objects_of_interest)
+    is_object_of_interest = np.array([track.id in interest_ids for track in scenario.tracks])
+    return track_ids, is_designated_target, is_object_of_interest
 
 ####    ------------------------------------------------------------- < MAP >
 MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
@@ -78,7 +118,7 @@ def map_feature_points(feature):
         raw_points = [feature.stop_sign.position]
     elif kind in MAP_POLYGON_KINDS:
         corners = getattr(feature, kind).polygon
-        if len(corners) == 0:
+        if len(corners) < 2:
             return None, None
         raw_points = list(corners) + [corners[0]]
     else:
@@ -108,7 +148,12 @@ def polyline_directions(points):
     if len(points) < 2:
         return np.zeros_like(points)
     steps = np.diff(points, axis=0)
-    directions = steps / np.linalg.norm(steps, axis=1, keepdims=True)
+    step_lengths = np.linalg.norm(steps, axis=1, keepdims=True)
+    zero_step_indices = np.flatnonzero(step_lengths[:, 0] == 0.0)
+    step_lengths[zero_step_indices] = 1.0
+    directions = steps / step_lengths
+    for zero_index in zero_step_indices:
+        directions[zero_index] = directions[zero_index - 1]
     return np.concatenate([directions, directions[-1:]])
 
 # Runs a feature through all above methods -> places them in ego/sdc coordiantes 
@@ -141,11 +186,37 @@ def scenario_traffic_signal_histories(scenario):
 # FLAG: # Joins everything built above into one finished N x 127 table for a single feature: geometry in every row, 
 #   kind one-hot, then the detail blocks only that kind fills (lane -> signals/type/speed, line/edge -> boundary type).
 # N (dots per feature) stays ragged on purpose: staging stores the world complete; the loader crops/rotates per 
-#   target agent at train time, where the choice costs a flag instead of a restage. 
+#   predicted agent at train time, where the choice costs a flag instead of a restage.
 # One scenario map per stageing, prev one per sample. Map - about 85% sample data. Current cut 1/3 map storage from per sample.
 #   Sample: one agent, at one moment, being asked the question. Scenario yields as many samples as it has agents worth predicting.
 # The scenario is the unit of storage; the sample is the unit of training
 #   WOMD Leaderboard asks for 8.
+#
+# The final matrix — map_rows (N_total, 127), one contiguous block of rows per feature:
+#
+#                   0  1   2  3    4 .. 10   11 ................ 109   110-113   114   115 .. 123  124-126
+#                ┌───────┬───────┬─────────┬─────────────────────────┬─────────┬─────┬─────────────────────┐
+#                │  POS  │  DIR  │  KIND   │      SIGNAL_STATE       │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │
+#                │  x  y │ dx dy │1-hot of7│ 11 steps x 9 states     │1-hot of4│ mph │ 9 road_line│3 r_edge│
+#                ├───────┼───────┼─────────┼─────────────────────────┼─────────┼─────┼────────────┼────────┤
+# lane           │  x  y │ dx dy │  1 @ 4  │ (11x9) 1-hot history *  │  1-hot  │ mph │     0      │   0    │
+# road_line      │  x  y │ dx dy │  1 @ 5  │            0            │    0    │  0  │ 1-hot of 9 │   0    │
+# road_edge      │  x  y │ dx dy │  1 @ 6  │            0            │    0    │  0  │     0      │1-hot/3 │
+# stop_sign      │  x  y │  0  0 │  1 @ 7  │            0            │    0    │  0  │     0      │   0    │
+# crosswalk      │  x  y │ dx dy │  1 @ 8  │            0            │    0    │  0  │     0      │   0    │
+# speed_bump     │  x  y │ dx dy │  1 @ 9  │            0            │    0    │  0  │     0      │   0    │
+# driveway       │  x  y │ dx dy │ 1 @ 10  │            0            │    0    │  0  │     0      │   0    │
+#                │   :   │   :   │    :    │            :            │    :    │  :  │     :      │   :    │
+#                └───────┴───────┴─────────┴─────────────────────────┴─────────┴─────┴────────────┴────────┘
+#                  ↑ one row = one 0.5 m dot
+#
+# Rows: features stay contiguous in scenario.map_features order (kinds interleave — one band per
+#   kind shown once). Block i has feature_lengths[i] rows; boundaries = cumsum(feature_lengths).
+# * SIGNAL [11:110] (99 of 127 cols): signalised lanes only, else zeros. Step-major:
+#   [11:20]=t-10 ... [101:110]=now. Within each 9-wide step: 0 UNKNOWN, 1 ARROW_STOP,
+#   2 ARROW_CAUTION, 3 ARROW_GO, 4 STOP, 5 CAUTION, 6 GO, 7 FLASHING_STOP, 8 FLASHING_CAUTION.
+# KIND hot column = 4 + kind index, in MAP_POLYLINE_KINDS order. stop_sign is a single dot -> DIR 0,0.
+# Column widths not to scale: SIGNAL alone is 78% of the row.
 def map_feature_rows(feature, origin, heading, signal_histories):
     stored_points, stored_arrows, kind_index = map_feature_to_storage_frame(feature, origin, heading)
     if stored_points is None or len(stored_points) == 0:
@@ -160,16 +231,34 @@ def map_feature_rows(feature, origin, heading, signal_histories):
     if kind == "lane":
         if feature.id in signal_histories:
             rows[:, contract.MAP_SIGNAL_STATE] = signal_histories[feature.id].reshape(-1)
+        assert feature.lane.type < contract.NUM_LANE_TYPES
         rows[:, contract.MAP_LANE_TYPE.start + feature.lane.type] = 1.0
         rows[:, contract.MAP_SPEED_LIMIT] = feature.lane.speed_limit_mph
     elif kind == "road_line":
+        assert feature.road_line.type < len(contract.ROAD_LINE_TYPES)
         rows[:, contract.MAP_BOUNDARY_TYPE.start + feature.road_line.type] = 1.0
     elif kind == "road_edge":
+        assert feature.road_edge.type < len(contract.ROAD_EDGE_TYPES)
         rows[:, contract.MAP_BOUNDARY_TYPE.start + len(contract.ROAD_LINE_TYPES) + feature.road_edge.type] = 1.0
 
     return rows
 
 # Turns a whole scenario's map into one packed thing
+#
+# COMPLETED HERE — the map matrix, map_rows (N_total, 127): every feature's row-table from
+#   map_feature_rows (diagram above), stacked top to bottom in scenario.map_features order.
+#   feature_lengths (F,) int64 records each block's height; cumsum recovers the boundaries.
+#
+#        map_rows                      feature_lengths = [L0, L1, L2, ...]
+#   ┌───────────────┐
+#   │  feature 0    │  rows 0 .. L0-1
+#   ├───────────────┤
+#   │  feature 1    │  rows L0 .. L0+L1-1
+#   ├───────────────┤
+#   │  feature 2    │  rows L0+L1 .. L0+L1+L2-1
+#   ├───────────────┤
+#   │      ...      │  (scenario 1: F=167 blocks, N_total=15,620 rows)
+#   └───────────────┘
 def scenario_map_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
     signal_histories = scenario_traffic_signal_histories(scenario)
@@ -186,3 +275,27 @@ def scenario_map_arrays(scenario):
     map_rows = np.concatenate(feature_tables)
     feature_lengths = np.array([len(table) for table in feature_tables], dtype=np.int64)
     return map_rows, feature_lengths
+
+## Write boundary: one scenario -> one .npz on disk. Float32 cast + compression live here and only here.
+def write_scenario(scenario, output_path):
+    assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
+        f"current_time_index {scenario.current_time_index}, scenario {scenario.scenario_id}"
+    )
+    track_rows, track_valid = scenario_track_arrays(scenario)
+    track_ids, is_designated_target, is_object_of_interest = scenario_track_labels(scenario)
+    map_rows, feature_lengths = scenario_map_arrays(scenario)
+    origin, heading = scenario_storage_frame(scenario)
+
+    np.savez_compressed(
+        output_path,
+        track_rows=track_rows.astype(np.float32),
+        track_valid=track_valid,
+        track_ids=track_ids,
+        is_designated_target=is_designated_target,
+        is_object_of_interest=is_object_of_interest,
+        map_rows=map_rows.astype(np.float32),
+        feature_lengths=feature_lengths,
+        frame_origin=origin.astype(np.float32),
+        frame_heading=np.float32(heading),
+        scenario_id=scenario.scenario_id,
+    )

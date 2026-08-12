@@ -9,6 +9,8 @@ CURRENT_STEP_INDEX = 10                         # "Now". Current pivot: before i
 TOTAL_STEPS = HISTORY_STEPS + FUTURE_STEPS
 PREDICTED_OBJECT_TYPES = ("TYPE_VEHICLE", "TYPE_PEDESTRIAN", "TYPE_CYCLIST")    # WOMD object labeling schema
 NUM_OBJECT_TYPES = len(PREDICTED_OBJECT_TYPES)
+AGENT_TYPES = PREDICTED_OBJECT_TYPES + ("TYPE_OTHER",)
+NUM_AGENT_TYPES = len(AGENT_TYPES)
 STAGING_CROP_RADIUS_METRES = 250.0              # VERIFY: Staging time constant: max travel scenario 133m, store.py disk writing governer.
 MAP_POINT_SPACING_METRES = 0.5
 NUM_PREDICTED_MODES = 6                         # Mode = possible future. We predict X futures. WOMD caps submissions at 6. Prune from X.
@@ -18,11 +20,12 @@ AGENT_HEADING_COSINE = 2
 AGENT_HEADING_SINE = 3
 AGENT_VELOCITY = slice(4, 6)
 AGENT_DIMENSIONS = slice(6, 8)
-AGENT_TYPE = slice(8, 8 + NUM_OBJECT_TYPES)
-AGENT_FEATURE_DIM = AGENT_TYPE.stop
+AGENT_TYPE = slice(8, 8 + NUM_AGENT_TYPES)
+AGENT_IS_SDC = AGENT_TYPE.stop
+AGENT_FEATURE_DIM = AGENT_IS_SDC + 1
 
 
-TARGET_AGENT_ARRAY_SPEC = {
+PREDICTED_AGENT_ARRAY_SPEC = {
     "agent_history": (HISTORY_STEPS, AGENT_FEATURE_DIM),
     "agent_history_mask": (HISTORY_STEPS,),
     "future_positions": (FUTURE_STEPS, 2),
@@ -32,6 +35,7 @@ TARGET_AGENT_ARRAY_SPEC = {
     "scenario_id": (),
     "track_id": (),
     "is_designated_target": (),    # For reporting final 8 WOMD requested Agent-Per-Scenario. Prune from ALL.
+    "is_object_of_interest": (),
 }
 
 TRAFFIC_SIGNAL_STATES = (
