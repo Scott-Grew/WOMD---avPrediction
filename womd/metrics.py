@@ -1,0 +1,37 @@
+# > Pure-torch training monitor: minADE / minFDE over the PRUNED 6 modes
+# Monitor only - every reported number comes from Waymo's scorer in the container. Counts
+# follow B5's lesson: minADE averages over samples with any valid future step, minFDE over
+# samples whose 8 s endpoint is present - never over batch size.
+
+import torch
+
+from womd.model import prune_modes_batched
+
+
+class MetricAccumulator:
+    def __init__(self):
+        self.ade_sum = 0.0
+        self.ade_count = 0
+        self.fde_sum = 0.0
+        self.fde_count = 0
+
+    def update(self, trajectories, confidence_logits, future_positions, future_mask):
+        kept_trajectories, _ = prune_modes_batched(trajectories, confidence_logits)
+        distances = (kept_trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
+        valid_steps = future_mask.unsqueeze(1)
+        summed = torch.where(valid_steps, distances, torch.zeros_like(distances)).sum(dim=-1)
+        average_distances = summed / future_mask.sum(dim=-1, keepdim=True)
+
+        has_any_valid_step = future_mask.any(dim=-1)
+        self.ade_sum += average_distances.min(dim=-1).values[has_any_valid_step].sum()
+        self.ade_count += has_any_valid_step.sum()
+
+        final_step_valid = future_mask[:, -1]
+        self.fde_sum += distances[:, :, -1].min(dim=-1).values[final_step_valid].sum()
+        self.fde_count += final_step_valid.sum()
+
+    def results(self):
+        return {
+            "min_ade": float(self.ade_sum / self.ade_count) if self.ade_count else float("nan"),
+            "min_fde": float(self.fde_sum / self.fde_count) if self.fde_count else float("nan"),
+        }

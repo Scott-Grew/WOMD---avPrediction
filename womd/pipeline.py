@@ -37,4 +37,6 @@ def batches(scenario_paths, worker_count, batch_size, prefetch_batches, seed):
         num_workers=worker_count,
         collate_fn=collate_samples,
         prefetch_factor=prefetch_batches if worker_count > 0 else None,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=worker_count > 0,
     )

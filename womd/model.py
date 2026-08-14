@@ -1,0 +1,254 @@
+# > The model: one agent's view of the scene in, six possible 8 s futures out
+# Every encoder outputs HIDDEN_DIM-wide embeddings; attention runs at that width.
+
+import torch
+from torch import nn
+
+from womd import contract
+
+HIDDEN_DIM = 128
+
+# Flatten the 11 history rows into one ordered vector (position-in-vector IS time, §28 flatten
+# ruling) plus the 11 validity flags, then MLP down to one embedding. Invalid rows are zeroed
+# FIRST: the loader's re-framing turns stored zero-rows into non-zero garbage positions, so the
+# mask is what says "missing", not the zeros.
+class AgentHistoryEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        input_width = contract.HISTORY_STEPS * (contract.AGENT_FEATURE_DIM + 1)
+        self.network = nn.Sequential(
+            nn.Linear(input_width, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+        )
+
+    def forward(self, agent_history, agent_history_mask):
+        validity = agent_history_mask.unsqueeze(-1).to(agent_history.dtype)
+        masked_history = agent_history * validity
+        flattened = torch.cat([masked_history, validity], dim=-1).flatten(start_dim=-2)
+        return self.network(flattened)
+
+
+# One embedding per 0.5 m map dot, over the batch's flat ragged block of dots - every row is
+# a real dot, so there is no padding to keep unread.
+class MapDotEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(contract.MAP_FEATURE_DIM, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+        )
+
+    def forward(self, map_rows):
+        return self.network(map_rows)
+
+
+# One token per POLYLINE, not per dot (§34 token-count recomputation, 2026-08-14: measured
+# p50 9,998 dots/sample makes per-dot attention ~3,800x the estimated cost). Every dot still
+# passes through the encoder; a max over each polyline's dot embeddings packages them as one
+# token. The batch's dots arrive flat and ragged, each carrying its global polyline slot, so
+# the max is one scatter over (batch_size * max_polylines) slots; a slot no dot landed in
+# comes out absent and zeroed.
+def pool_dots_to_polyline_tokens(dot_embeddings, dot_polyline_slot, batch_size, max_polylines):
+    hidden_width = dot_embeddings.shape[-1]
+    tokens = torch.full(
+        (batch_size * max_polylines, hidden_width), float("-inf"),
+        dtype=dot_embeddings.dtype, device=dot_embeddings.device,
+    )
+    tokens = tokens.scatter_reduce(
+        0, dot_polyline_slot.unsqueeze(-1).expand(-1, hidden_width),
+        dot_embeddings, reduce="amax", include_self=True,
+    )
+    polyline_present = tokens[:, 0] > float("-inf")
+    tokens = torch.where(polyline_present.unsqueeze(-1), tokens, torch.zeros_like(tokens))
+    return (
+        tokens.view(batch_size, max_polylines, hidden_width),
+        polyline_present.view(batch_size, max_polylines),
+    )
+
+
+ATTENTION_HEAD_COUNT = 4
+SCENE_ATTENTION_ROUNDS = 6
+FEEDFORWARD_DIM = 4 * HIDDEN_DIM
+
+
+# Structure is ours (projections, heads, masking); the inner score-softmax-weight step is
+# torch's fused kernel. key_present True = this token may be read; padded slots stay unread.
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        assert HIDDEN_DIM % ATTENTION_HEAD_COUNT == 0
+        self.query_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+        self.key_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+        self.value_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+        self.output_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+
+    def split_heads(self, projected):
+        batch_size, token_count, _ = projected.shape
+        per_head = HIDDEN_DIM // ATTENTION_HEAD_COUNT
+        return projected.view(batch_size, token_count, ATTENTION_HEAD_COUNT, per_head).transpose(1, 2)
+
+    def forward(self, query_tokens, key_value_tokens, key_present):
+        queries = self.split_heads(self.query_projection(query_tokens))
+        keys = self.split_heads(self.key_projection(key_value_tokens))
+        values = self.split_heads(self.value_projection(key_value_tokens))
+        readable = key_present[:, None, None, :]
+        attended = nn.functional.scaled_dot_product_attention(queries, keys, values, attn_mask=readable)
+        merged = attended.transpose(1, 2).flatten(start_dim=-2)
+        return self.output_projection(merged)
+
+
+# One self-attention round, pre-norm: normalise, attend, add back; normalise, feedforward, add
+# back. Padded tokens produce garbage outputs but nothing downstream reads an absent token.
+class SceneAttentionLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention_norm = nn.LayerNorm(HIDDEN_DIM)
+        self.attention = MultiHeadAttention()
+        self.feedforward_norm = nn.LayerNorm(HIDDEN_DIM)
+        self.feedforward = nn.Sequential(
+            nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
+            nn.ReLU(),
+            nn.Linear(FEEDFORWARD_DIM, HIDDEN_DIM),
+        )
+
+    def forward(self, tokens, token_present):
+        normed = self.attention_norm(tokens)
+        tokens = tokens + self.attention(normed, normed, token_present)
+        return tokens + self.feedforward(self.feedforward_norm(tokens))
+
+
+# The whole scene as one token sequence: [predicted agent | neighbours | map dots], agent first.
+# Predicted agent and neighbours get separate encoder weights - different roles. A neighbour is
+# present if it has at least one valid snapshot; the agent is present by construction.
+class SceneEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.agent_encoder = AgentHistoryEncoder()
+        self.neighbour_encoder = AgentHistoryEncoder()
+        self.map_encoder = MapDotEncoder()
+        self.layers = nn.ModuleList(SceneAttentionLayer() for _ in range(SCENE_ATTENTION_ROUNDS))
+
+    def forward(self, batch):
+        agent_token = self.agent_encoder(batch["agent_history"], batch["agent_history_mask"]).unsqueeze(1)
+        neighbour_tokens = self.neighbour_encoder(batch["neighbour_history"], batch["neighbour_history_mask"])
+        map_tokens, map_present = pool_dots_to_polyline_tokens(
+            self.map_encoder(batch["map_rows"]), batch["map_dot_polyline_slot"],
+            agent_token.shape[0], int(batch["max_polylines_in_batch"]),
+        )
+
+        tokens = torch.cat([agent_token, neighbour_tokens, map_tokens], dim=1)
+        agent_present = torch.ones(agent_token.shape[:2], dtype=torch.bool, device=tokens.device)
+        neighbour_present = batch["neighbour_history_mask"].any(dim=-1)
+        token_present = torch.cat([agent_present, neighbour_present, map_present], dim=1)
+
+        for layer in self.layers:
+            tokens = layer(tokens, token_present)
+        return tokens, token_present
+
+
+QUERY_COUNT = 64
+PRUNE_DISTANCE_METRES = 2.5
+
+# 64 learned queries, each a standing question the model owns. Each cross-attends over the
+# scene tokens and a SHARED head writes its trajectory + confidence - modes differ only by
+# their query vector, so query count is a config number.
+class ModeDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(QUERY_COUNT, HIDDEN_DIM) * 0.02)
+        self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
+        self.cross_attention = MultiHeadAttention()
+        self.trajectory_head = nn.Sequential(
+            nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
+            nn.ReLU(),
+            nn.Linear(FEEDFORWARD_DIM, contract.FUTURE_STEPS * 2),
+        )
+        self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
+
+    def forward(self, tokens, token_present):
+        batch_size = tokens.shape[0]
+        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
+        read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
+        trajectories = self.trajectory_head(read).view(batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2)
+        confidence_logits = self.confidence_head(read).squeeze(-1)
+        return trajectories, confidence_logits
+
+
+# Confidence-ordered endpoint pruning (MTR's reduction): walk modes by descending confidence,
+# keep one whose 8 s endpoint sits at least PRUNE_DISTANCE_METRES from every kept endpoint.
+# Fewer than 6 survivors -> backfill with the most confident dropped modes; always exactly 6 out.
+def prune_modes(trajectories, confidence_logits):
+    kept_indices = []
+    dropped_indices = []
+    endpoints = trajectories[:, -1]
+    for mode_index in torch.argsort(confidence_logits, descending=True).tolist():
+        if kept_indices and bool(
+            (torch.cdist(endpoints[mode_index][None], endpoints[kept_indices]) < PRUNE_DISTANCE_METRES).any()
+        ):
+            dropped_indices.append(mode_index)
+            continue
+        kept_indices.append(mode_index)
+        if len(kept_indices) == contract.NUM_PREDICTED_MODES:
+            break
+    kept_indices.extend(dropped_indices[: contract.NUM_PREDICTED_MODES - len(kept_indices)])
+    kept = torch.tensor(kept_indices, device=trajectories.device)
+    return trajectories[kept], confidence_logits[kept]
+
+
+# The same walk run for every sample at once. The walk stays sequential because the rule is
+# greedy, but each step is one batched comparison, so nothing forces a device synchronisation.
+def prune_modes_batched(trajectories, confidence_logits):
+    batch_size, mode_count = confidence_logits.shape
+    device = trajectories.device
+    endpoints = trajectories[:, :, -1]
+    confidence_order = torch.argsort(confidence_logits, dim=-1, descending=True)
+    slot_positions = torch.arange(contract.NUM_PREDICTED_MODES, device=device)
+
+    kept_indices = torch.zeros(batch_size, contract.NUM_PREDICTED_MODES, dtype=torch.long, device=device)
+    kept_endpoints = torch.zeros_like(endpoints[:, : contract.NUM_PREDICTED_MODES])
+    kept_slot_filled = torch.zeros(batch_size, contract.NUM_PREDICTED_MODES, dtype=torch.bool, device=device)
+    kept_count = torch.zeros(batch_size, dtype=torch.long, device=device)
+    dropped_indices = torch.zeros_like(kept_indices)
+    dropped_count = torch.zeros_like(kept_count)
+
+    for walk_position in range(mode_count):
+        candidate_index = confidence_order[:, walk_position]
+        candidate_endpoint = endpoints.gather(1, candidate_index[:, None, None].expand(-1, -1, 2))
+        separations = torch.cdist(candidate_endpoint, kept_endpoints).squeeze(1)
+        too_close = ((separations < PRUNE_DISTANCE_METRES) & kept_slot_filled).any(dim=-1)
+        still_walking = kept_count < contract.NUM_PREDICTED_MODES
+
+        keeps = still_walking & ~too_close
+        keep_slot = keeps[:, None] & (slot_positions[None, :] == kept_count[:, None])
+        kept_indices = torch.where(keep_slot, candidate_index[:, None], kept_indices)
+        kept_endpoints = torch.where(keep_slot[:, :, None], candidate_endpoint, kept_endpoints)
+        kept_slot_filled = kept_slot_filled | keep_slot
+        kept_count = kept_count + keeps.long()
+
+        drops = still_walking & too_close
+        drop_slot = drops[:, None] & (slot_positions[None, :] == dropped_count[:, None])
+        dropped_indices = torch.where(drop_slot, candidate_index[:, None], dropped_indices)
+        dropped_count = dropped_count + drops.long()
+
+    backfill_positions = (slot_positions[None, :] - kept_count[:, None]).clamp(min=0)
+    final_indices = torch.where(
+        slot_positions[None, :] < kept_count[:, None],
+        kept_indices,
+        dropped_indices.gather(1, backfill_positions),
+    )
+    trajectory_selector = final_indices[:, :, None, None].expand(-1, -1, *trajectories.shape[2:])
+    return trajectories.gather(1, trajectory_selector), confidence_logits.gather(1, final_indices)
+
+
+# Training reads all 64 modes; prune_modes runs only at evaluation/submission.
+class MotionPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scene_encoder = SceneEncoder()
+        self.mode_decoder = ModeDecoder()
+
+    def forward(self, batch):
+        tokens, token_present = self.scene_encoder(batch)
+        return self.mode_decoder(tokens, token_present)

@@ -54,19 +54,26 @@ def track_rows_to_agent_frame(rows, origin, heading):
     reframed[..., contract.AGENT_HEADING_SINE] = heading_sine * rotation_cosine - heading_cosine * rotation_sine
     return reframed
 
-def crop_and_reframe_map(map_rows, origin, heading, speed):
+def crop_and_reframe_map(map_rows, dot_polyline_index, dot_has_traffic_signal, origin, heading, speed):
     agent_frame_positions = frame_ops.positions_to_agent_frame(map_rows[:, contract.MAP_POSITION], origin, heading)
     crop_mask = inside_crop(agent_frame_positions, BASE_RADIUS_METRES, 1.0 + STRETCH_GAIN * speed)
     reframed = map_rows[crop_mask]
     reframed[:, contract.MAP_POSITION] = agent_frame_positions[crop_mask]
     reframed[:, contract.MAP_DIRECTION] = frame_ops.directions_to_agent_frame(reframed[:, contract.MAP_DIRECTION], heading)
-    has_signal = reframed[:, contract.MAP_SIGNAL_STATE].any(axis=1)
+    has_signal = dot_has_traffic_signal[crop_mask]
     reframed[has_signal, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(reframed[has_signal, contract.MAP_STOP_POINT], origin, heading)
-    return reframed
+    surviving_polylines, compact_polyline_index = np.unique(
+        dot_polyline_index[crop_mask], return_inverse=True
+    )
+    return reframed, compact_polyline_index
 
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
-        return {name: scenario_file[name] for name in scenario_file.files}
+        scenario_array = {name: scenario_file[name] for name in scenario_file.files}
+    feature_lengths = scenario_array["feature_lengths"]
+    scenario_array["map_dot_polyline_index"] = np.repeat(np.arange(len(feature_lengths)), feature_lengths)
+    scenario_array["map_dot_has_traffic_signal"] = scenario_array["map_rows"][:, contract.MAP_SIGNAL_STATE].any(axis=1)
+    return scenario_array
 
 def build_sample(scenario_array, track_index):
     track_rows = scenario_array["track_rows"]
@@ -82,8 +89,15 @@ def build_sample(scenario_array, track_index):
     )
 
     speed = float(np.linalg.norm(track_rows[track_index, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY]))
-    agent_map = crop_and_reframe_map(scenario_array["map_rows"], origin, heading, speed)
-    
+    agent_map, map_polyline_index = crop_and_reframe_map(
+        scenario_array["map_rows"],
+        scenario_array["map_dot_polyline_index"],
+        scenario_array["map_dot_has_traffic_signal"],
+        origin,
+        heading,
+        speed,
+    )
+
     return {
         "agent_history": agent_track[:contract.HISTORY_STEPS],
         "agent_history_mask": track_valid[track_index, :contract.HISTORY_STEPS],
@@ -92,6 +106,7 @@ def build_sample(scenario_array, track_index):
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": track_valid[neighbour_indices, :contract.HISTORY_STEPS],
         "map_rows": agent_map,
+        "map_polyline_index": map_polyline_index.astype(np.int64),
         "frame_origin": origin,
         "frame_heading": heading,
         "scenario_id": scenario_array["scenario_id"],
@@ -100,25 +115,27 @@ def build_sample(scenario_array, track_index):
         "is_object_of_interest": scenario_array["is_object_of_interest"][track_index],
     }
 
+# Only the neighbour and polyline axes are padded to a common width. The map dots stay ragged:
+# every sample's dots are concatenated into one flat block, and each dot carries the global
+# polyline slot (sample_index * max_polylines_in_batch + polyline index within the sample) it
+# pools into, so the dot axis never pays for the batch's largest crop.
 def build_batch(samples):
     batch_size = len(samples)
     max_neighbours = max(sample["neighbour_history"].shape[0] for sample in samples)
-    max_map_rows = max(sample["map_rows"].shape[0] for sample in samples)
+    max_polylines_in_batch = max(
+        int(sample["map_polyline_index"].max()) + 1 if len(sample["map_polyline_index"]) else 0
+        for sample in samples
+    )
 
     neighbour_history = np.zeros(
         (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
     )
     neighbour_history_mask = np.zeros((batch_size, max_neighbours, contract.HISTORY_STEPS), dtype=bool)
-    map_rows = np.zeros((batch_size, max_map_rows, contract.MAP_FEATURE_DIM), dtype=np.float32)
-    map_row_mask = np.zeros((batch_size, max_map_rows), dtype=bool)
 
     for sample_index, sample in enumerate(samples):
         neighbour_count = sample["neighbour_history"].shape[0]
         neighbour_history[sample_index, :neighbour_count] = sample["neighbour_history"]
         neighbour_history_mask[sample_index, :neighbour_count] = sample["neighbour_history_mask"]
-        dot_count = sample["map_rows"].shape[0]
-        map_rows[sample_index, :dot_count] = sample["map_rows"]
-        map_row_mask[sample_index, :dot_count] = True
 
     return {
         "agent_history": np.stack([sample["agent_history"] for sample in samples]),
@@ -127,6 +144,15 @@ def build_batch(samples):
         "future_mask": np.stack([sample["future_mask"] for sample in samples]),
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": neighbour_history_mask,
-        "map_rows": map_rows,
-        "map_row_mask": map_row_mask,
+        "map_rows": np.concatenate(
+            [sample["map_rows"] for sample in samples], dtype=np.float32
+        ),
+        "map_dot_polyline_slot": np.concatenate(
+            [
+                sample["map_polyline_index"] + sample_index * max_polylines_in_batch
+                for sample_index, sample in enumerate(samples)
+            ],
+            dtype=np.int64,
+        ),
+        "max_polylines_in_batch": np.array(max_polylines_in_batch, dtype=np.int64),
     }

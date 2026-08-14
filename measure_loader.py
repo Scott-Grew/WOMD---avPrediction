@@ -78,7 +78,8 @@ def timed_pipeline_epoch(staged_directory, worker_count, batch_size, prefetch_ba
     batch_count = 0
     sample_count = 0
     start = time.perf_counter()
-    for batch in pipeline.batches(scenario_paths, worker_count, batch_size, prefetch_batches, seed=0):
+    stream = pipeline.batches(scenario_paths, worker_count, batch_size, prefetch_batches, 0)
+    for batch in stream:
         batch_count += 1
         sample_count += batch["agent_history"].shape[0]
     epoch_seconds = time.perf_counter() - start

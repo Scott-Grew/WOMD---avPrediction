@@ -2,9 +2,10 @@ import io
 
 import numpy as np
 import pytest
+import torch
 
 from waymo_open_dataset.protos import scenario_pb2
-from womd import contract, frame_ops, loader, store, tfrecord
+from womd import contract, frame_ops, loader, model, store, tfrecord
 
 
 def test_crc32c_matches_known_answer():
@@ -83,3 +84,51 @@ def test_v6_storage_then_agent_frame_matches_direct_world_to_agent():
     assert np.allclose(two_step[:, contract.AGENT_HEADING_COSINE], np.cos(direct_headings), atol=1e-3)
     assert np.allclose(two_step[:, contract.AGENT_HEADING_SINE], np.sin(direct_headings), atol=1e-3)
     assert np.allclose(two_step[:, contract.AGENT_VELOCITY], direct_velocities, atol=1e-3)
+
+
+def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
+    torch.manual_seed(11)
+    predictor = model.MotionPredictor().eval()
+    batch = {
+        "agent_history": torch.randn(2, 11, 13),
+        "agent_history_mask": torch.ones(2, 11, dtype=torch.bool),
+        "neighbour_history": torch.randn(2, 6, 11, 13),
+        "neighbour_history_mask": torch.ones(2, 6, 11, dtype=torch.bool),
+        "map_rows": torch.randn(80, 129),
+        "map_dot_polyline_slot": torch.arange(80) // 8,
+        "max_polylines_in_batch": torch.tensor(5),
+    }
+    batch["neighbour_history_mask"][:, 5] = False
+
+    neighbour_order = torch.randperm(6)
+    map_order = torch.randperm(80)
+    permuted = dict(batch)
+    permuted["neighbour_history"] = batch["neighbour_history"][:, neighbour_order]
+    permuted["neighbour_history_mask"] = batch["neighbour_history_mask"][:, neighbour_order]
+    permuted["map_rows"] = batch["map_rows"][map_order]
+    permuted["map_dot_polyline_slot"] = batch["map_dot_polyline_slot"][map_order]
+
+    with torch.no_grad():
+        base_trajectories, base_logits = predictor(batch)
+        permuted_trajectories, permuted_logits = predictor(permuted)
+
+    assert torch.allclose(base_trajectories, permuted_trajectories, atol=1e-5)
+    assert torch.allclose(base_logits, permuted_logits, atol=1e-5)
+
+
+def test_polyline_pooling_isolates_groups_and_leaves_empty_slots_absent():
+    torch.manual_seed(5)
+    dot_embeddings = torch.randn(9, 8)
+    dot_polyline_slot = torch.tensor([0, 0, 0, 1, 1, 1, 3, 3, 4])
+
+    tokens, present = model.pool_dots_to_polyline_tokens(dot_embeddings, dot_polyline_slot, 2, 3)
+    assert tokens.shape == (2, 3, 8)
+    assert present.tolist() == [[True, True, False], [True, True, False]]
+    assert torch.all(tokens[:, 2] == 0.0)
+
+    poisoned = dot_embeddings.clone()
+    poisoned[:3] = 999.0
+    poisoned_tokens, _ = model.pool_dots_to_polyline_tokens(poisoned, dot_polyline_slot, 2, 3)
+    assert torch.equal(poisoned_tokens[0, 1:], tokens[0, 1:])
+    assert torch.equal(poisoned_tokens[1], tokens[1])
+    assert not torch.equal(poisoned_tokens[0, 0], tokens[0, 0])
