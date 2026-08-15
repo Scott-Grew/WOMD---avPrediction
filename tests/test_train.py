@@ -2,7 +2,7 @@ import torch
 
 import train
 from womd import contract, loss
-from womd.model import MotionPredictor
+from womd.model import MotionPredictor, unit_anchor_offsets
 
 
 def build_synthetic_map_rows(dot_count):
@@ -15,7 +15,7 @@ def build_synthetic_map_rows(dot_count):
 
 def test_one_training_step_runs_forward_loss_backward_and_optimizer_step():
     torch.manual_seed(0)
-    predictor = MotionPredictor()
+    predictor = MotionPredictor(unit_anchor_offsets())
     optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
     batch = {
         "agent_history": torch.randn(2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
@@ -32,15 +32,15 @@ def test_one_training_step_runs_forward_loss_backward_and_optimizer_step():
         "future_positions": torch.randn(2, contract.FUTURE_STEPS, 2),
         "future_headings": torch.nn.functional.normalize(torch.randn(2, contract.FUTURE_STEPS, 2), dim=-1),
         "future_mask": torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
-        "drivable_positions": torch.randn(2, 7, 2),
-        "drivable_mask": torch.ones(2, 7, dtype=torch.bool),
     }
 
-    trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
-    total, _, _, _, _ = loss.prediction_loss(
+    (
+        trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+    ) = predictor.predict_with_heading(batch)
+    total, _, _, _ = loss.prediction_loss(
         trajectories, heading_cosine_sine, confidence_logits,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
-        batch["drivable_positions"], batch["drivable_mask"], 1.0, 1.0,
+        predictor.unit_anchors, reachable_distance_metres, 1.0,
     )
     optimizer.zero_grad()
     total.backward()

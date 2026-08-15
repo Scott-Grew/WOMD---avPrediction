@@ -11,10 +11,6 @@ from womd import contract, frame_ops
 
 BASE_RADIUS_METRES = 80.0
 STRETCH_GAIN = 0.5
-DRIVABLE_KIND_COLUMNS = [
-    contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index(kind)
-    for kind in ("lane", "crosswalk", "driveway", "speed_bump")
-]
 
 # Crop membership: stretched-forward half-ellipse in the agent's frame. Rear half stays a
 # circle of base_radius; the forward semi-axis is base_radius * forward_stretch, where the
@@ -212,7 +208,6 @@ def build_sample(scenario_array, track_index):
         heading,
         speed,
     )
-    is_drivable_dot = (agent_map[:, DRIVABLE_KIND_COLUMNS] == 1.0).any(axis=1)
 
     return {
         "agent_history": agent_track[:contract.HISTORY_STEPS],
@@ -226,7 +221,6 @@ def build_sample(scenario_array, track_index):
         "map_chunk_index": map_chunk_index.astype(np.int64),
         "map_chunk_signal_history": map_chunk_signal_history,
         "map_chunk_lane_context": map_chunk_lane_context,
-        "drivable_positions": agent_map[is_drivable_dot, contract.MAP_POSITION],
         "frame_origin": origin,
         "frame_heading": heading,
         "scenario_id": scenario_array["scenario_id"],
@@ -235,7 +229,7 @@ def build_sample(scenario_array, track_index):
         "is_object_of_interest": scenario_array["is_object_of_interest"][track_index],
     }
 
-# Only the neighbour, chunk and drivable-dot axes are padded to a common width - the chunk signal histories
+# Only the neighbour and chunk axes are padded to a common width - the chunk signal histories
 # pad on the chunk axis with the zeros an unsignalled chunk already carries. The map dots stay ragged:
 # every sample's dots are concatenated into one flat block, and each dot carries the global
 # chunk slot (sample_index * max_chunks_in_batch + chunk index within the sample) it pools
@@ -248,7 +242,6 @@ def build_batch(samples):
         int(sample["map_chunk_index"].max()) + 1 if len(sample["map_chunk_index"]) else 0
         for sample in samples
     )
-    max_drivable_dots = max(sample["drivable_positions"].shape[0] for sample in samples)
 
     neighbour_history = np.zeros(
         (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
@@ -261,8 +254,6 @@ def build_batch(samples):
     map_chunk_lane_context = np.zeros(
         (batch_size, max_chunks_in_batch, contract.LANE_CONTEXT_DIM), dtype=np.float32
     )
-    drivable_positions = np.zeros((batch_size, max_drivable_dots, 2), dtype=np.float32)
-    drivable_mask = np.zeros((batch_size, max_drivable_dots), dtype=bool)
 
     for sample_index, sample in enumerate(samples):
         neighbour_count = sample["neighbour_history"].shape[0]
@@ -271,9 +262,6 @@ def build_batch(samples):
         chunk_count = sample["map_chunk_signal_history"].shape[0]
         map_chunk_signal_history[sample_index, :chunk_count] = sample["map_chunk_signal_history"]
         map_chunk_lane_context[sample_index, :chunk_count] = sample["map_chunk_lane_context"]
-        drivable_count = sample["drivable_positions"].shape[0]
-        drivable_positions[sample_index, :drivable_count] = sample["drivable_positions"]
-        drivable_mask[sample_index, :drivable_count] = True
 
     return {
         "agent_history": np.stack([sample["agent_history"] for sample in samples]),
@@ -295,7 +283,5 @@ def build_batch(samples):
         ),
         "map_chunk_signal_history": map_chunk_signal_history,
         "map_chunk_lane_context": map_chunk_lane_context,
-        "drivable_positions": drivable_positions,
-        "drivable_mask": drivable_mask,
         "max_polylines_in_batch": np.array(max_chunks_in_batch, dtype=np.int64),
     }

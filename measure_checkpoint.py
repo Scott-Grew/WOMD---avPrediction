@@ -5,8 +5,11 @@
 # much of each agent's own reachable budget the predictions spend.
 # The random draw is the control the confidence number is read against: a confidence head that
 # cannot beat it has learned nothing about which mode to trust, whatever the loss curve says.
+# The anchor null is the control the MODEL is read against, on the same samples in the same table:
+# the six most-used fitted anchors driven to in a straight line with the scene unread. A model that
+# cannot beat it has learned nothing the anchors did not already carry.
 # Every distance is masked to the steps the logged track actually recorded.
-# Run: python3 measure_checkpoint.py checkpoint.pt ../data/staged
+# Run: python3 measure_checkpoint.py checkpoint.pt ../data/staged fitted_anchors.npz
 
 import sys
 from pathlib import Path
@@ -14,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import contract, metrics, model, pipeline
+from womd import baseline, contract, metrics, model, pipeline
 
 SAMPLE_LIMIT = 512
 RANDOM_DRAW_SEED = 0
@@ -29,12 +32,15 @@ def mode_mean_distances(trajectories, future_positions, future_mask):
 def main():
     checkpoint_path = Path(sys.argv[1])
     staged_directory = Path(sys.argv[2])
-    predictor = model.MotionPredictor()
+    fitted_anchors_path = Path(sys.argv[3])
+    with np.load(fitted_anchors_path) as fitted_anchors_file:
+        unit_anchors = torch.from_numpy(fitted_anchors_file["unit_anchors"])
+    predictor = model.MotionPredictor(unit_anchors)
     predictor.load_state_dict(torch.load(checkpoint_path, map_location="cpu")["model_state"])
     predictor.eval()
     generator = torch.Generator().manual_seed(RANDOM_DRAW_SEED)
 
-    all_modes, by_confidence, at_random, widest_gap, budget_use = [], [], [], [], []
+    all_modes, by_confidence, at_random, anchor_null, widest_gap, budget_use = [], [], [], [], [], []
     sample_count = 0
     for batch in pipeline.batches(sorted(staged_directory.glob("*.npz")), 0, 16, 0, 0, True):
         with torch.no_grad():
@@ -62,9 +68,17 @@ def main():
             trajectories[scoreable][..., :1, :], trajectories[scoreable].diff(dim=-2)
         ], dim=-2)
 
+        null_trajectories, _ = baseline.straight_lines_to_most_used_anchors(batch, unit_anchors)
+        null_distances = mode_mean_distances(
+            null_trajectories[scoreable],
+            batch["future_positions"][scoreable],
+            batch["future_mask"][scoreable],
+        )
+
         all_modes.append(distances.min(dim=1).values)
         by_confidence.append(pruned_distances.min(dim=1).values)
         at_random.append(distances.gather(1, draw).min(dim=1).values)
+        anchor_null.append(null_distances.min(dim=1).values)
         widest_gap.append(torch.cdist(endpoints, endpoints).amax(dim=(1, 2)))
         budget_use.append(steps.norm(dim=-1).sum(dim=-1).amax(dim=1) / reachable)
         sample_count += int(scoreable.sum())
@@ -73,8 +87,8 @@ def main():
 
     joined = {name: torch.cat(values).numpy() for name, values in (
         ("best of ALL modes", all_modes), ("best of 6 by CONFIDENCE", by_confidence),
-        ("best of 6 at RANDOM", at_random), ("widest gap between modes", widest_gap),
-        ("path / reachable budget", budget_use),
+        ("best of 6 at RANDOM", at_random), ("best of 6 ANCHOR NULL", anchor_null),
+        ("widest gap between modes", widest_gap), ("path / reachable budget", budget_use),
     )}
     print(f"{checkpoint_path} on {staged_directory}: {sample_count} designated targets")
     print(f"{'quantity':28s}{'mean':>10s}{'p50':>10s}{'p90':>10s}{'max':>10s}")

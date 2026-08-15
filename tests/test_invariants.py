@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+import fit_anchors
 import train
 from waymo_open_dataset.protos import scenario_pb2
 from womd import baseline, contract, frame_ops, loader, loss, metrics, model, pipeline, store, tfrecord
@@ -93,7 +94,7 @@ def test_v6_storage_then_agent_frame_matches_direct_world_to_agent():
 
 def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
     torch.manual_seed(11)
-    predictor = model.MotionPredictor().eval()
+    predictor = model.MotionPredictor(model.unit_anchor_offsets()).eval()
     batch = {
         "agent_history": torch.randn(2, 11, 13),
         "agent_history_mask": torch.ones(2, 11, dtype=torch.bool),
@@ -257,6 +258,54 @@ def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
     assert torch.equal(pruned, turning_trajectories.expand(-1, contract.NUM_PREDICTED_MODES, -1, -1))
 
 
+def test_v4_anchor_null_drives_the_reachable_distance_to_each_most_used_anchor_in_a_straight_line():
+    unit_anchors = model.unit_anchor_offsets()
+    current_speeds = torch.tensor([8.0, 0.0])
+    agent_history = torch.zeros(2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
+    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.stack(
+        [current_speeds, torch.zeros(2)], dim=-1
+    )
+    batch = {"agent_history": agent_history}
+
+    trajectories, confidence_logits = baseline.straight_lines_to_most_used_anchors(
+        batch, unit_anchors
+    )
+    reachable_distance_metres = model.agent_reachable_distance(agent_history)
+
+    assert trajectories.shape == (2, contract.NUM_PREDICTED_MODES, contract.FUTURE_STEPS, 2)
+    assert confidence_logits.shape == (2, contract.NUM_PREDICTED_MODES)
+    assert torch.allclose(
+        trajectories[:, :, -1],
+        reachable_distance_metres[:, None, None]
+        * unit_anchors[: contract.NUM_PREDICTED_MODES][None],
+        atol=1e-4,
+    )
+
+    steps = torch.cat([trajectories[..., :1, :], trajectories.diff(dim=-2)], dim=-2)
+    assert torch.allclose(steps, steps[..., :1, :].expand_as(steps), atol=1e-5)
+
+
+def test_anchor_fitting_recovers_tight_well_separated_clusters_and_leaves_no_anchor_empty():
+    random_generator = np.random.default_rng(17)
+    cluster_centres = model.unit_anchor_offsets() + torch.tensor(
+        random_generator.uniform(-0.08, 0.08, (model.QUERY_COUNT, 2)), dtype=torch.float32
+    )
+    endpoints = (
+        cluster_centres[:, None, :]
+        + torch.tensor(
+            random_generator.normal(0.0, 0.005, (model.QUERY_COUNT, 50, 2)), dtype=torch.float32
+        )
+    ).reshape(-1, 2)
+
+    fitted, assignment, _, _, stopped_by_convergence = fit_anchors.fit_unit_anchors(endpoints)
+    counts = fit_anchors.endpoints_per_centre(assignment, model.QUERY_COUNT)
+
+    assert stopped_by_convergence
+    assert fitted.shape == (model.QUERY_COUNT, 2)
+    assert torch.allclose(fitted, cluster_centres, atol=0.01)
+    assert int(counts.min()) > 0
+
+
 def test_batched_pruning_walk_matches_the_single_sample_walk():
     torch.manual_seed(7)
     trajectories = model.PRUNE_DISTANCE_METRES * torch.randn(
@@ -280,7 +329,7 @@ def test_batched_pruning_walk_matches_the_single_sample_walk():
 
 def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
     torch.manual_seed(13)
-    predictor = model.MotionPredictor().eval()
+    predictor = model.MotionPredictor(model.unit_anchor_offsets()).eval()
     with torch.no_grad():
         predictor.mode_decoder.trajectory_head[-1].weight.mul_(1000.0)
         predictor.mode_decoder.trajectory_head[-1].bias.mul_(1000.0)
@@ -321,55 +370,86 @@ def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
     assert (distances <= reachable[:, None, None] * float32_rounding_headroom).all()
 
 
-def regression_and_offroad_terms(trajectories, future_positions, drivable_positions):
-    mode_count, step_count = trajectories.shape[1:3]
-    heading_cosine_sine = torch.zeros(1, mode_count, step_count, 2)
-    heading_cosine_sine[..., 0] = 1.0
-    future_headings = torch.zeros(1, step_count, 2)
-    future_headings[..., 0] = 1.0
-    _, regression, _, _, offroad = loss.prediction_loss(
-        trajectories, heading_cosine_sine, torch.zeros(1, mode_count),
-        future_positions, future_headings, torch.ones(1, step_count, dtype=torch.bool),
-        drivable_positions, torch.ones(drivable_positions.shape[:2], dtype=torch.bool), 0.0, 0.0,
+def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
+    torch.manual_seed(29)
+    unit_anchors = model.unit_anchor_offsets()
+    predictor = model.MotionPredictor(unit_anchors).eval()
+    with torch.no_grad():
+        predictor.mode_decoder.queries.zero_()
+
+    agent_history = torch.randn(1, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
+    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.tensor([10.0, 0.0])
+    map_rows = torch.randn(12, contract.MAP_FEATURE_DIM)
+    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = 0.0
+    batch = {
+        "agent_history": agent_history,
+        "agent_history_mask": torch.ones(1, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(1, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(1, 2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "map_rows": map_rows,
+        "map_dot_polyline_slot": torch.zeros(12, dtype=torch.long),
+        "map_chunk_signal_history": torch.zeros(
+            1, 1, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_chunk_lane_context": torch.zeros(1, 1, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(1),
+    }
+
+    forward_mode = 0
+    backward_mode = model.ANCHOR_DISTANCE_COUNT * (model.ANCHOR_DIRECTION_COUNT // 2)
+    swapped_order = torch.arange(model.QUERY_COUNT)
+    swapped_order[[forward_mode, backward_mode]] = swapped_order[[backward_mode, forward_mode]]
+    with torch.no_grad():
+        endpoints = predictor(batch)[0][0, :, -1]
+        predictor.mode_decoder.unit_anchors.copy_(unit_anchors[swapped_order])
+        swapped_endpoints = predictor(batch)[0][0, :, -1]
+
+    assert (endpoints[forward_mode] - endpoints[backward_mode]).norm() > 1.0
+    assert torch.allclose(swapped_endpoints[forward_mode], endpoints[backward_mode], atol=1e-4)
+    assert torch.allclose(swapped_endpoints[backward_mode], endpoints[forward_mode], atol=1e-4)
+    untouched_modes = [
+        mode for mode in range(model.QUERY_COUNT) if mode not in (forward_mode, backward_mode)
+    ]
+    assert torch.allclose(swapped_endpoints[untouched_modes], endpoints[untouched_modes], atol=1e-4)
+
+
+def test_opposed_logged_endpoints_are_assigned_to_opposed_anchor_territories():
+    unit_anchors = model.unit_anchor_offsets()
+    reachable_distance_metres = torch.tensor([40.0, 40.0])
+    future_positions = torch.zeros(2, contract.FUTURE_STEPS, 2)
+    future_positions[0, :, 0] = torch.linspace(0.5, 40.0, contract.FUTURE_STEPS)
+    future_positions[1, :, 0] = torch.linspace(-0.5, -40.0, contract.FUTURE_STEPS)
+    future_mask = torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool)
+
+    assigned_mode = loss.anchor_assigned_mode(
+        unit_anchors, reachable_distance_metres, future_positions, future_mask
     )
-    return float(regression), float(offroad)
+
+    assert assigned_mode[0] != assigned_mode[1]
+    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(unit_anchors[assigned_mode[1]], torch.tensor([-1.0, 0.0]), atol=1e-6)
 
 
-def test_offroad_term_charges_only_what_the_prediction_adds_over_the_logged_future():
-    drivable_positions = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
-    logged_on_a_drivable_dot = torch.tensor([[[0.0, 0.0]]])
-    predicted_on_drivable_dots = torch.tensor([[[[0.0, 0.0]], [[10.0, 0.0]]]])
-    predicted_four_metres_off = torch.tensor([[[[0.0, 4.0]], [[10.0, 4.0]]]])
-    logged_one_metre_off = torch.tensor([[[0.0, 1.0]]])
+def test_assignment_reads_the_last_valid_future_step_and_not_the_padded_tail():
+    unit_anchors = model.unit_anchor_offsets()
+    reachable_distance_metres = torch.tensor([40.0])
+    future_positions = torch.zeros(1, contract.FUTURE_STEPS, 2)
+    future_positions[0, :10, 0] = 40.0
+    future_mask = torch.zeros(1, contract.FUTURE_STEPS, dtype=torch.bool)
+    future_mask[0, :10] = True
 
-    _, on_road_offroad = regression_and_offroad_terms(
-        predicted_on_drivable_dots, logged_on_a_drivable_dot, drivable_positions
+    assigned_mode = loss.anchor_assigned_mode(
+        unit_anchors, reachable_distance_metres, future_positions, future_mask
     )
-    _, offroad_against_logged_dot = regression_and_offroad_terms(
-        predicted_four_metres_off, logged_on_a_drivable_dot, drivable_positions
-    )
-    _, offroad_against_offset_logged = regression_and_offroad_terms(
-        predicted_four_metres_off, logged_one_metre_off, drivable_positions
-    )
-
-    assert on_road_offroad == 0.0
-    assert offroad_against_logged_dot == pytest.approx(4.0)
-    assert offroad_against_offset_logged == pytest.approx(3.0)
-
-
-def test_offroad_term_reaches_a_losing_mode_the_winning_mode_never_touches():
-    drivable_positions = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
-    logged_future = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
-    trajectories = torch.stack(
-        [logged_future, logged_future + torch.tensor([0.0, 6.0])], dim=1
+    padded_tail_mode = loss.anchor_assigned_mode(
+        unit_anchors, reachable_distance_metres, future_positions, torch.ones_like(future_mask)
     )
 
-    regression, offroad = regression_and_offroad_terms(
-        trajectories, logged_future, drivable_positions
+    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([1.0, 0.0]), atol=1e-6)
+    assert padded_tail_mode[0] != assigned_mode[0]
+    assert float(unit_anchors[padded_tail_mode[0]].norm()) == pytest.approx(
+        1.0 / model.ANCHOR_DISTANCE_COUNT
     )
-
-    assert regression == 0.0
-    assert offroad == pytest.approx(3.0)
 
 
 def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
@@ -378,15 +458,17 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
 
     torch.manual_seed(0)
-    predictor = model.MotionPredictor()
+    predictor = model.MotionPredictor(model.unit_anchor_offsets())
     optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
     batch = next(iter(pipeline.batches(scenario_paths, 0, 2, 0, 0, True)))
 
-    trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
+    (
+        trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+    ) = predictor.predict_with_heading(batch)
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, confidence_logits,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
-        batch["drivable_positions"], batch["drivable_mask"], 1.0, 1.0,
+        predictor.unit_anchors, reachable_distance_metres, 1.0,
     )
     assert torch.stack(components).isfinite().all()
     components[0].backward()

@@ -195,6 +195,18 @@ class SceneEncoder(nn.Module):
 
 QUERY_COUNT = 18
 PRUNE_DISTANCE_METRES = 2.5
+ANCHOR_DIRECTION_COUNT = 6
+ANCHOR_DISTANCE_COUNT = 3
+assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
+
+
+
+def unit_anchor_offsets():
+    direction_indices = torch.arange(ANCHOR_DIRECTION_COUNT).repeat_interleave(ANCHOR_DISTANCE_COUNT)
+    distance_indices = torch.arange(ANCHOR_DISTANCE_COUNT).repeat(ANCHOR_DIRECTION_COUNT)
+    angles = 2 * torch.pi * direction_indices / ANCHOR_DIRECTION_COUNT
+    fractions = (distance_indices + 1) / ANCHOR_DISTANCE_COUNT
+    return fractions.unsqueeze(-1) * torch.stack([angles.cos(), angles.sin()], dim=-1)
 
 
 # The furthest this agent could physically get inside the prediction horizon, one distance per
@@ -246,16 +258,25 @@ def fence_to_reachable_path_length(raw_position, reachable_distance_metres):
     return raw_position * fenced_length / path_length.clamp_min(torch.finfo(raw_position.dtype).eps)
 
 
-# QUERY_COUNT learned queries, each a standing question the model owns. Each cross-attends over the
-# scene tokens and a SHARED head writes its trajectory + confidence - modes differ only by
-# their query vector, so query count is a config number. The head writes four numbers per future
+# QUERY_COUNT learned queries, each a standing question the model owns, and each owning one anchor -
+# the territory it is assigned logged futures from, starting at the anchor set the constructor is
+# handed and free to move. There is no default: which futures each mode is assigned is a modelling
+# claim, so a caller states where its anchors come from rather than inheriting one from this file.
+# The anchor is added to the query so the mode knows which territory it holds, and again to the
+# head's raw position so the anchor sits in the output and is pulled by the regression term of the
+# mode it was assigned to; both additions happen in budget-fraction space, before the fence, so the
+# fence still bounds the whole trajectory. Each query cross-attends over the scene tokens and a
+# SHARED head writes its trajectory + confidence - modes differ by their query vector and by their
+# anchor, so query count is a config number. The head writes four numbers per future
 # step: two position, then the heading as a cosine/sine PAIR rather than an angle, so nothing
 # downstream has to wrap. Only the position half passes through the fence - a cosine/sine pair is
 # unit-scale already and loss.py normalises it to the unit circle before scoring it.
 class ModeDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, initial_unit_anchors):
         super().__init__()
         self.queries = nn.Parameter(torch.randn(QUERY_COUNT, HIDDEN_DIM) * 0.02)
+        self.unit_anchors = nn.Parameter(initial_unit_anchors.detach().clone())
+        self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
         self.cross_attention = MultiHeadAttention()
         self.trajectory_head = nn.Sequential(
@@ -267,14 +288,18 @@ class ModeDecoder(nn.Module):
 
     def forward(self, tokens, token_present, reachable_distance_metres):
         batch_size = tokens.shape[0]
-        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
+        anchored_queries = self.queries + self.anchor_projection(self.unit_anchors)
+        queries = anchored_queries.unsqueeze(0).expand(batch_size, -1, -1)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
         position_and_heading = self.trajectory_head(read).view(
             batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 4
         )
         confidence_logits = self.confidence_head(read).squeeze(-1)
+        anchored_position = (
+            position_and_heading[..., :2] + self.unit_anchors[None, :, None, :]
+        )
         return (
-            fence_to_reachable_path_length(position_and_heading[..., :2], reachable_distance_metres),
+            fence_to_reachable_path_length(anchored_position, reachable_distance_metres),
             position_and_heading[..., 2:],
             confidence_logits,
         )
@@ -372,17 +397,23 @@ def prune_modes_batched(trajectories, confidence_logits):
 # the submission path all speak; the auxiliary heading is a training-only output and is reached
 # through predict_with_heading, which the epoch loop calls instead.
 class MotionPredictor(nn.Module):
-    def __init__(self):
+    def __init__(self, initial_unit_anchors):
         super().__init__()
         self.scene_encoder = SceneEncoder()
-        self.mode_decoder = ModeDecoder()
+        self.mode_decoder = ModeDecoder(initial_unit_anchors)
+
+    @property
+    def unit_anchors(self):
+        return self.mode_decoder.unit_anchors
 
     def predict_with_heading(self, batch):
         tokens, token_present = self.scene_encoder(batch)
-        return self.mode_decoder(
-            tokens, token_present, agent_reachable_distance(batch["agent_history"])
+        reachable_distance_metres = agent_reachable_distance(batch["agent_history"])
+        trajectories, heading_cosine_sine, confidence_logits = self.mode_decoder(
+            tokens, token_present, reachable_distance_metres
         )
+        return trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
 
     def forward(self, batch):
-        trajectories, _, confidence_logits = self.predict_with_heading(batch)
+        trajectories, _, confidence_logits, _ = self.predict_with_heading(batch)
         return trajectories, confidence_logits

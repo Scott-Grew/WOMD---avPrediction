@@ -194,14 +194,16 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
 
     with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
         timer.start("forward")
-        trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
+        (
+            trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+        ) = predictor.predict_with_heading(batch)
         timer.stop("forward")
 
         timer.start("loss")
-        total, _, _, _, _ = loss.prediction_loss(
+        total, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            batch["drivable_positions"], batch["drivable_mask"], 1.0, 1.0
+            predictor.unit_anchors, reachable_distance_metres, 1.0
         )
         timer.stop("loss")
 
@@ -345,7 +347,7 @@ def main():
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictor = MotionPredictor().to(device)
+    predictor = MotionPredictor(model.unit_anchor_offsets()).to(device)
     optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
     gradient_scaler = train.GradScaler(
         enabled=arguments.mixed_precision and device.type == "cuda"

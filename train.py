@@ -1,10 +1,13 @@
 # > Training entry point: recipe v1 - plain AdamW, constant rate, no schedule, no clipping
 # The epoch loop computes the loss components and the minADE/minFDE monitor ONLY. Weight decay
-# skips biases, LayerNorms and the 64 learned queries - parameters whose job is to become
-# non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied forward).
+# skips biases, LayerNorms, the learned queries and the learned anchors - parameters whose job
+# is to become or stay non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied
+# forward). Decaying the anchors would drag the fan toward the origin, a modelling claim nobody made.
 # LEARNING_RATE 1e-3 and WEIGHT_DECAY 0.01 are Scott's provisional values, 2026-08-13,
-# falsifiable from the first training curve. --heading-loss-weight and --offroad-loss-weight carry
-# no default: an auxiliary term's weight is set per run and never inherited from the code.
+# falsifiable from the first training curve. --heading-loss-weight carries no default: an auxiliary
+# term's weight is set per run and never inherited from the code. --anchors carries no default
+# either: the initial anchor set decides which futures each mode is assigned, so a run states where
+# it came from. A --resume run overwrites those anchors with the trained ones in the state dict.
 # ade_80step / fde_80step are NOT the leaderboard's minADE / minFDE and are named so nobody can
 # read them as such: they average over all 80 valid future steps at 10 Hz, while a WOMD submission
 # is 16 steps at 2 Hz scored by Waymo's own referee, which lives in the container and does not
@@ -21,10 +24,11 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from womd import loss, metrics, pipeline
-from womd.model import MotionPredictor
+from womd.model import QUERY_COUNT, MotionPredictor
 
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
@@ -37,7 +41,7 @@ def parameter_groups(predictor):
     decayed = []
     undecayed = []
     for name, parameter in predictor.named_parameters():
-        if parameter.ndim >= 2 and not name.endswith("queries"):
+        if parameter.ndim >= 2 and not name.endswith(("queries", "unit_anchors")):
             decayed.append(parameter)
         else:
             undecayed.append(parameter)
@@ -57,14 +61,12 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, checkpoint_state)
 
 def train_epoch(
     predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
-    offroad_loss_weight, checkpoint_path, previous_checkpoint_path, checkpoint_every_seconds,
+    checkpoint_path, previous_checkpoint_path, checkpoint_every_seconds,
     epoch_index, seed,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
-    loss_sums = {
-        "total": 0.0, "regression": 0.0, "classification": 0.0, "heading": 0.0, "offroad": 0.0,
-    }
+    loss_sums = {"total": 0.0, "regression": 0.0, "classification": 0.0, "heading": 0.0}
     window_loss_sums = dict.fromkeys(loss_sums, 0.0)
     seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
     batch_count = 0
@@ -81,12 +83,13 @@ def train_epoch(
         step_start = time.perf_counter()
         batch = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
-            trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
-            total, regression, classification, heading, offroad = loss.prediction_loss(
+            (
+                trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+            ) = predictor.predict_with_heading(batch)
+            total, regression, classification, heading = loss.prediction_loss(
                 trajectories, heading_cosine_sine, confidence_logits,
                 batch["future_positions"], batch["future_headings"], batch["future_mask"],
-                batch["drivable_positions"], batch["drivable_mask"],
-                heading_loss_weight, offroad_loss_weight,
+                predictor.unit_anchors, reachable_distance_metres, heading_loss_weight,
             )
         optimizer.zero_grad()
         gradient_scaler.scale(total).backward()
@@ -99,7 +102,6 @@ def train_epoch(
             "regression": float(regression.detach()),
             "classification": float(classification.detach()),
             "heading": float(heading.detach()),
-            "offroad": float(offroad.detach()),
         }
         for name, value in component_values.items():
             loss_sums[name] += value
@@ -146,7 +148,6 @@ def train_epoch(
                 f"kept modes {window_monitor['mean_kept_modes']:.2f} "
                 f"backfilled {100 * window_monitor['backfill_rate']:.0f}% | "
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / window_loss_sums['regression']:.4f} "
-                f"off/reg {offroad_loss_weight * window_loss_sums['offroad'] / window_loss_sums['regression']:.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
                 f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
@@ -193,7 +194,7 @@ def main():
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--heading-loss-weight", type=float, required=True)
-    parser.add_argument("--offroad-loss-weight", type=float, required=True)
+    parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
@@ -204,7 +205,13 @@ def main():
 
     torch.manual_seed(arguments.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictor = MotionPredictor().to(device)
+    with np.load(arguments.anchors) as anchors_file:
+        initial_unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
+    assert initial_unit_anchors.shape == (QUERY_COUNT, 2), (
+        f"{arguments.anchors} holds unit_anchors of shape {tuple(initial_unit_anchors.shape)},"
+        f" but the model has {QUERY_COUNT} modes and needs ({QUERY_COUNT}, 2)"
+    )
+    predictor = MotionPredictor(initial_unit_anchors).to(device)
     optimizer = torch.optim.AdamW(parameter_groups(predictor), lr=LEARNING_RATE)
     gradient_scaler = GradScaler(enabled=arguments.mixed_precision and device.type == "cuda")
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))
@@ -228,15 +235,14 @@ def main():
         )
         averages, monitor, seconds = train_epoch(
             predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
-            arguments.offroad_loss_weight, arguments.checkpoint_path, previous_checkpoint_path,
+            arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
         )
         print(
             f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
             f" + cls {averages['classification']:.4f}"
-            f" + hdg {averages['heading']:.4f}"
-            f" + off {averages['offroad']:.4f}) | "
+            f" + hdg {averages['heading']:.4f}) | "
             f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
             f"kept modes {monitor['mean_kept_modes']:.2f}"
             f" | backfilled {100 * monitor['backfill_rate']:.0f}% | "

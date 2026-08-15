@@ -1,15 +1,16 @@
-# > Null baselines: the future the logged state already implies, with nothing learned
-# Both take the batch MotionPredictor.forward takes and return what it returns - trajectories in
+# > Null baselines: futures nothing learned about this scene, for the model to be read against
+# Each takes the batch MotionPredictor.forward takes and returns what it returns - trajectories in
 # metres in the predicted agent's own frame, plus confidence logits - so metrics.MetricAccumulator
-# scores baseline and model through one path (V4). Neither has a free parameter: constant velocity
-# assumes the logged velocity persists, CTRV assumes the logged yaw rate persists with it, and
-# there is nothing in either to tune toward a flattering number.
+# scores baseline and model through one path (V4). None has a free parameter: constant velocity
+# assumes the logged velocity persists, CTRV assumes the logged yaw rate persists with it, the
+# anchor null drives straight to the destinations logged futures actually reach, and there is
+# nothing in any of them to tune toward a flattering number.
 
 import math
 
 import torch
 
-from womd import contract
+from womd import contract, model
 
 # WOMD asks for 8 s of future and contract.FUTURE_STEPS covers exactly that, so a step is 0.1 s -
 # the dataset's 10 Hz logging rate, divided out of the contract rather than typed in.
@@ -104,3 +105,19 @@ def constant_turn_rate_and_velocity(batch):
         [chord_length * torch.cos(chord_direction), chord_length * torch.sin(chord_direction)], dim=-1
     )
     return as_single_mode(position[:, None, :] + displacement)
+
+
+def straight_lines_to_most_used_anchors(batch, unit_anchors):
+    reachable_distance_metres = model.agent_reachable_distance(batch["agent_history"])
+    most_used_anchors = unit_anchors[: contract.NUM_PREDICTED_MODES].to(
+        reachable_distance_metres.dtype
+    )
+    endpoints = reachable_distance_metres[:, None, None] * most_used_anchors[None]
+    elapsed_seconds = future_elapsed_seconds(endpoints.device, endpoints.dtype)
+    trajectories = (
+        endpoints[:, :, None, :]
+        * (elapsed_seconds / FUTURE_HORIZON_SECONDS)[None, None, :, None]
+    )
+    return trajectories, torch.zeros(
+        trajectories.shape[:2], device=trajectories.device, dtype=trajectories.dtype
+    )

@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 from womd import contract, pipeline
-from womd.model import MotionPredictor
+from womd.model import MotionPredictor, unit_anchor_offsets
 
 BATCH_SIZE = 32
 FIXED_SEED = 0
@@ -85,7 +85,7 @@ def main():
     staged_directory = Path(sys.argv[2])
 
     torch.manual_seed(FIXED_SEED)
-    predictor = MotionPredictor()
+    predictor = MotionPredictor(unit_anchor_offsets())
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     predictor.load_state_dict(checkpoint["model_state"])
     predictor.eval()

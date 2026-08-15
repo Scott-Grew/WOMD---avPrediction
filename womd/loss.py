@@ -1,9 +1,17 @@
-# > Training loss: best-of-64 winner-take-all, in metres
-# Regression IS minADE's definition - mean Euclidean distance over valid steps, best mode only -
-# so training optimises the exact quantity the leaderboard grades. Zero free parameters in the
-# distance; the one knob is the classification weight (§14 sweep, provisional 1.0).
-# The heading term is auxiliary and scores the SAME mode the position term won with - letting it
-# pick its own winner would let the two terms pull toward different futures. It is the Euclidean
+# > Training loss: one scored mode per anchor territory, in metres
+# The scored mode is the one whose ANCHOR endpoint sits nearest the logged endpoint, not the one
+# whose own prediction landed closest, so no mode can be starved of gradient by never happening to
+# win. The anchors are learned, so the assignment is read from their CURRENT value but detached: the
+# choice stays a hard non-differentiable one and an anchor moves through the regression term of the
+# mode it was assigned to, never by making itself easier to select. The distance itself is unchanged and still has zero free parameters -
+# mean Euclidean distance over valid steps, one mode, which is minADE's definition - so training
+# still optimises the quantity the leaderboard grades; the one knob is the classification weight
+# (§14 sweep, provisional 1.0).
+# The logged endpoint is the last VALID future position, never future_positions[:, -1]: a track can
+# stop early, and reading the padded tail would assign every early-ending sample to whichever anchor
+# sits nearest the origin.
+# The heading term is auxiliary and scores the SAME mode the position term does - letting it pick
+# its own winner would let the two terms pull toward different futures. It is the Euclidean
 # distance between the predicted heading cosine/sine pair and the logged one: the same form as the
 # position term so the two magnitudes are comparable, monotone in absolute angle error, and with no
 # angle anywhere there is no wraparound to handle and no free parameter to choose.
@@ -28,53 +36,23 @@ import torch
 MODE_CLASSIFICATION_WEIGHT = 1.0
 
 
-def nearest_drivable_dot_index(query_positions, drivable_positions, drivable_mask):
-    separations = torch.cdist(query_positions, drivable_positions)
-    separations.masked_fill_(~drivable_mask.unsqueeze(1), float("inf"))
-    return separations.argmin(dim=-1)
-
-
-def gather_drivable_dots(drivable_positions, dot_indices):
-    return drivable_positions.gather(1, dot_indices.unsqueeze(-1).expand(-1, -1, 2))
-
-
-def offroad_excess_beyond_logged(
-    trajectories, future_positions, future_mask, drivable_positions, drivable_mask,
-):
-    batch_size, mode_count = trajectories.shape[:2]
-    if drivable_positions.shape[1] == 0:
-        return trajectories.new_zeros(batch_size)
-
-    validity = future_mask.to(trajectories.dtype)
-    valid_step_counts = validity.sum(dim=-1).clamp_min(1.0)
-    with torch.no_grad():
-        logged_dots = gather_drivable_dots(
-            drivable_positions,
-            nearest_drivable_dot_index(future_positions, drivable_positions, drivable_mask),
-        )
-        logged_distances = (future_positions - logged_dots).norm(dim=-1)
-
-    mode_mean_excess = []
-    for mode_index in range(mode_count):
-        mode_positions = trajectories[:, mode_index]
-        with torch.no_grad():
-            dot_indices = nearest_drivable_dot_index(
-                mode_positions, drivable_positions, drivable_mask
-            )
-        nearest_dots = gather_drivable_dots(drivable_positions, dot_indices)
-        excess = (
-            (mode_positions - nearest_dots).norm(dim=-1) - logged_distances
-        ).relu()
-        mode_mean_excess.append((excess * validity).sum(dim=-1) / valid_step_counts)
-
-    sample_has_drivable_dot = drivable_mask.any(dim=-1).to(trajectories.dtype)
-    return torch.stack(mode_mean_excess, dim=1).mean(dim=1) * sample_has_drivable_dot
+def anchor_assigned_mode(unit_anchors, reachable_distance_metres, future_positions, future_mask):
+    validity = future_mask.to(future_positions.dtype)
+    step_positions = torch.arange(
+        future_mask.shape[-1], device=future_mask.device, dtype=future_positions.dtype
+    )
+    last_valid_step = (validity * step_positions).argmax(dim=-1)
+    logged_endpoint = future_positions.gather(
+        1, last_valid_step[:, None, None].expand(-1, -1, 2)
+    ).squeeze(1)
+    anchor_endpoints = unit_anchors.detach().unsqueeze(0) * reachable_distance_metres[:, None, None]
+    return (anchor_endpoints - logged_endpoint.unsqueeze(1)).norm(dim=-1).argmin(dim=1)
 
 
 def prediction_loss(
     trajectories, heading_cosine_sine, confidence_logits,
     future_positions, future_headings, future_mask,
-    drivable_positions, drivable_mask, heading_loss_weight, offroad_loss_weight,
+    unit_anchors, reachable_distance_metres, heading_loss_weight,
 ):
     step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
     unit_heading_cosine_sine = heading_cosine_sine / heading_cosine_sine.norm(
@@ -91,25 +69,22 @@ def prediction_loss(
     scoreable = (valid_step_counts[:, 0] > 0).to(step_distances.dtype)
     scoreable_count = scoreable.sum().clamp_min(1.0)
 
-    best_mode = mode_mean_distance.argmin(dim=1)
+    assigned_mode = anchor_assigned_mode(
+        unit_anchors, reachable_distance_metres, future_positions, future_mask
+    )
     regression = (
-        mode_mean_distance.gather(1, best_mode[:, None]).squeeze(1) * scoreable
+        mode_mean_distance.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
     ).sum() / scoreable_count
     heading = (
-        mode_mean_heading_distance.gather(1, best_mode[:, None]).squeeze(1) * scoreable
+        mode_mean_heading_distance.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
     ).sum() / scoreable_count
     classification = (
-        torch.nn.functional.cross_entropy(confidence_logits, best_mode, reduction="none") * scoreable
-    ).sum() / scoreable_count
-    offroad = (
-        offroad_excess_beyond_logged(
-            trajectories, future_positions, future_mask, drivable_positions, drivable_mask
-        ) * scoreable
+        torch.nn.functional.cross_entropy(confidence_logits, assigned_mode, reduction="none")
+        * scoreable
     ).sum() / scoreable_count
     total = (
         regression
         + MODE_CLASSIFICATION_WEIGHT * classification
         + heading_loss_weight * heading
-        + offroad_loss_weight * offroad
     )
-    return total, regression, classification, heading, offroad
+    return total, regression, classification, heading
