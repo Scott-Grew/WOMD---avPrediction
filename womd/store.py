@@ -109,7 +109,7 @@ def scenario_track_labels(scenario):
 ####    ------------------------------------------------------------- < MAP >
 MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
 
-# Reads shape WOMD drew -> preserve WOMD labeling, pull its points 
+# Reads shape WOMD drew -> preserve WOMD labeling and pull its points.
 def map_feature_points(feature):
     kind = feature.WhichOneof("feature_data")
     if kind is None:
@@ -128,20 +128,30 @@ def map_feature_points(feature):
     points = np.array([[point.x, point.y] for point in raw_points])
     return points, contract.MAP_POLYLINE_KINDS.index(kind)
 
-# Walk the shape from start to end -> drop a new dot every half metre -> return 2d-array.
-def points_along_polyline(points, spacing):
+# Walk the shape from start to end -> read one per-point column at every dot dropped along the way.
+# The walk is parameterised by arc length, so a dot lands every MAP_POINT_SPACING_METRES of travel
+# and reads whatever the column held at that distance.
+def column_along_polyline(points, column_values, spacing):
     if len(points) < 2:
-        return points
+        return column_values
     segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
     arc_lengths = np.concatenate([[0.0], np.cumsum(segment_lengths)])
     total_length = arc_lengths[-1]
     if total_length == 0.0:
-        return points[:1]
+        return column_values[:1]
     sample_distances = np.arange(0.0, total_length, spacing)
     sample_distances = np.append(sample_distances, total_length)
-    spaced_x = np.interp(sample_distances, arc_lengths, points[:, 0])
-    spaced_y = np.interp(sample_distances, arc_lengths, points[:, 1])
-    return np.stack([spaced_x, spaced_y], axis=1)
+    return np.interp(sample_distances, arc_lengths, column_values)
+
+# Walk the shape from start to end -> drop a new dot every MAP_POINT_SPACING_METRES -> 2d-array.
+def points_along_polyline(points, spacing):
+    if len(points) < 2:
+        return points
+    return np.stack(
+        [column_along_polyline(points, points[:, 0], spacing),
+         column_along_polyline(points, points[:, 1], spacing)],
+        axis=1,
+    )
 
 # Takes evenly placed 0.5 dots applied from function above and give them a diretion -> 
 def polyline_directions(points):
@@ -190,42 +200,41 @@ def scenario_traffic_signal_histories(scenario):
             )
     return histories, stop_points
 
-# FLAG: # Joins everything built above into one finished N x 129 table for a single feature: geometry in every row,
-#   kind one-hot, then the detail blocks only that kind fills (lane -> signals/type/speed/stop point, line/edge -> boundary type).
-# N (dots per feature) stays ragged on purpose: staging stores the world complete; the loader crops/rotates per 
+# FLAG: # Joins everything built above into one finished N x 30 table for a single feature: geometry in every row,
+#   kind one-hot, then the detail blocks only that kind fills (lane -> type/speed/stop point, line/edge -> boundary type).
+# N (dots per feature) stays ragged on purpose: staging stores the world complete; the loader crops/rotates per
 #   predicted agent at train time, where the choice costs a flag instead of a restage.
 # One scenario map per stageing, prev one per sample. Map - about 85% sample data. Current cut 1/3 map storage from per sample.
 #   Sample: one agent, at one moment, being asked the question. Scenario yields as many samples as it has agents worth predicting.
 # The scenario is the unit of storage; the sample is the unit of training
 #   WOMD Leaderboard asks for 8.
 #
-# The final matrix — map_rows (N_total, 129), one contiguous block of rows per feature:
+# The final matrix — map_rows (N_total, 30), one contiguous block of rows per feature:
 #
-#                   0  1   2  3    4 .. 10   11 ................ 109   110-113   114   115 .. 123  124-126  127-128
-#                ┌───────┬───────┬─────────┬─────────────────────────┬─────────┬─────┬─────────────────────┬───────┐
-#                │  POS  │  DIR  │  KIND   │      SIGNAL_STATE       │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │ STOP  │
-#                │  x  y │ dx dy │1-hot of7│ 11 steps x 9 states     │1-hot of4│ mph │ 9 road_line│3 r_edge│ sx sy │
-#                ├───────┼───────┼─────────┼─────────────────────────┼─────────┼─────┼────────────┼────────┼───────┤
-# lane           │  x  y │ dx dy │  1 @ 4  │ (11x9) 1-hot history *  │  1-hot  │ mph │     0      │   0    │ sx sy │
-# road_line      │  x  y │ dx dy │  1 @ 5  │            0            │    0    │  0  │ 1-hot of 9 │   0    │  0 0  │
-# road_edge      │  x  y │ dx dy │  1 @ 6  │            0            │    0    │  0  │     0      │1-hot/3 │  0 0  │
-# stop_sign      │  x  y │  0  0 │  1 @ 7  │            0            │    0    │  0  │     0      │   0    │  0 0  │
-# crosswalk      │  x  y │ dx dy │  1 @ 8  │            0            │    0    │  0  │     0      │   0    │  0 0  │
-# speed_bump     │  x  y │ dx dy │  1 @ 9  │            0            │    0    │  0  │     0      │   0    │  0 0  │
-# driveway       │  x  y │ dx dy │ 1 @ 10  │            0            │    0    │  0  │     0      │   0    │  0 0  │
-#                │   :   │   :   │    :    │            :            │    :    │  :  │     :      │   :    │   :   │
-#                └───────┴───────┴─────────┴─────────────────────────┴─────────┴─────┴────────────┴────────┴───────┘
-#                  ↑ one row = one 0.5 m dot
+#                   0  1   2  3    4 .. 10    11-14    15    16 .. 24   25-27   28-29
+#                ┌───────┬───────┬─────────┬─────────┬─────┬────────────┬────────┬───────┐
+#                │  POS  │  DIR  │  KIND   │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │ STOP  │
+#                │  x  y │ dx dy │1-hot of7│1-hot of4│ mph │ 9 road_line│3 r_edge│ sx sy │
+#                ├───────┼───────┼─────────┼─────────┼─────┼────────────┼────────┼───────┤
+# lane           │  x  y │ dx dy │  1 @ 4  │  1-hot  │ mph │     0      │   0    │ sx sy │
+# road_line      │  x  y │ dx dy │  1 @ 5  │    0    │  0  │ 1-hot of 9 │   0    │  0 0  │
+# road_edge      │  x  y │ dx dy │  1 @ 6  │    0    │  0  │     0      │1-hot/3 │  0 0  │
+# stop_sign      │  x  y │  0  0 │  1 @ 7  │    0    │  0  │     0      │   0    │  0 0  │
+# crosswalk      │  x  y │ dx dy │  1 @ 8  │    0    │  0  │     0      │   0    │  0 0  │
+# speed_bump     │  x  y │ dx dy │  1 @ 9  │    0    │  0  │     0      │   0    │  0 0  │
+# driveway       │  x  y │ dx dy │ 1 @ 10  │    0    │  0  │     0      │   0    │  0 0  │
+#                │   :   │   :   │    :    │    :    │  :  │     :      │   :    │   :   │
+#                └───────┴───────┴─────────┴─────────┴─────┴────────────┴────────┴───────┘
+#                  ↑ one row = one dot, MAP_POINT_SPACING_METRES apart
 #
 # Rows: features stay contiguous in scenario.map_features order (kinds interleave — one band per
 #   kind shown once). Block i has feature_lengths[i] rows; boundaries = cumsum(feature_lengths).
-# * SIGNAL [11:110] (99 of 129 cols): signalised lanes only, else zeros. Step-major:
-#   [11:20]=t-10 ... [101:110]=now. Within each 9-wide step: 0 UNKNOWN, 1 ARROW_STOP,
-#   2 ARROW_CAUTION, 3 ARROW_GO, 4 STOP, 5 CAUTION, 6 GO, 7 FLASHING_STOP, 8 FLASHING_CAUTION.
+# The traffic-signal history is NOT here: it is constant along a lane, so it lives once per
+#   polyline in the (F, 11, 9) array scenario_map_arrays returns, not 99 repeated columns per dot.
 # KIND hot column = 4 + kind index, in MAP_POLYLINE_KINDS order. stop_sign is a single dot -> DIR 0,0.
-# STOP [127:129]: signalised lanes only — the signal's stop point in the storage frame, same pair
-#   on every dot of that lane; zeros everywhere else (an unsignalled lane has no stop point).
-# Column widths not to scale: SIGNAL alone is 77% of the row.
+# STOP [28:30]: signalised lanes only — the signal's stop point in the storage frame, same pair
+#   on every dot of that lane; zeros everywhere else (an unsignalled lane has no stop point). It
+#   stays per dot because it is geometry the dot encoder reads against that dot's own position.
 def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points):
     stored_points, stored_arrows, kind_index = map_feature_to_storage_frame(feature, origin, heading)
     if stored_points is None or len(stored_points) == 0:
@@ -239,7 +248,6 @@ def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_poi
 
     if kind == "lane":
         if feature.id in signal_histories:
-            rows[:, contract.MAP_SIGNAL_STATE] = signal_histories[feature.id].reshape(-1)
             rows[:, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(
                 signal_stop_points[feature.id], origin, heading
             )
@@ -255,9 +263,23 @@ def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_poi
 
     return rows
 
+# The one 11 x 9 signal history this polyline lives under, or zeros when it lives under none.
+# Only lanes carry signals; a lane WOMD never lit in the history second is unsignalled like any
+# crosswalk. One history per polyline, never per dot - it is the same light for the whole lane.
+def map_feature_signal_history(feature, signal_histories):
+    if feature.WhichOneof("feature_data") == "lane" and feature.id in signal_histories:
+        return signal_histories[feature.id]
+    return np.zeros((contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES))
+
+# map.proto LaneCenter.interpolating = 3: True when WOMD interpolated this lane centre between two
+# other lanes instead of surveying it, so the geometry is inferred rather than observed. False for
+# every kind that is not a lane, which is exactly what it means - only lane centres are interpolated.
+def map_feature_is_interpolating(feature):
+    return feature.WhichOneof("feature_data") == "lane" and feature.lane.interpolating
+
 # Turns a whole scenario's map into one packed thing
 #
-# COMPLETED HERE — the map matrix, map_rows (N_total, 129): every feature's row-table from
+# COMPLETED HERE — the map matrix, map_rows (N_total, 30): every feature's row-table from
 #   map_feature_rows (diagram above), stacked top to bottom in scenario.map_features order.
 #   feature_lengths (F,) int64 records each block's height; cumsum recovers the boundaries.
 #
@@ -269,29 +291,250 @@ def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_poi
 #   ├───────────────┤
 #   │  feature 2    │  rows L0+L1 .. L0+L1+L2-1
 #   ├───────────────┤
-#   │      ...      │  (scenario 1: F=167 blocks, N_total=15,620 rows)
+#   │      ...      │  (first scenario of validation.tfrecord-00000-of-00150:
+#   │               │   F=167 blocks, N_total=7,924 rows)
 #   └───────────────┘
+#
+# COMPLETED HERE — the signal tensor, polyline_signal_histories (F, 11, 9): row i is polyline i's
+#   traffic-signal history, index-for-index with feature_lengths, zeros for every unsignalled
+#   polyline. Step-major within a row: [0]=t-10 ... [10]=now; within a step: 0 UNKNOWN,
+#   1 ARROW_STOP, 2 ARROW_CAUTION, 3 ARROW_GO, 4 STOP, 5 CAUTION, 6 GO, 7 FLASHING_STOP,
+#   8 FLASHING_CAUTION. The loader hands each chunk token the row of the polyline it was cut from.
+#
+# Two more arrays ride alongside, both index-for-index with feature_lengths:
+#
+#   ┌───────────────────────────────────────────┐
+#   │ feature_ids (F,)                 int64    │
+#   │   WOMD MapFeature.id — the join key every  │
+#   │   lane-graph table below resolves against  │
+#   │ feature_is_interpolating (F,)     bool     │
+#   │   LaneCenter.interpolating, False non-lane │
+#   └───────────────────────────────────────────┘
+#
+# feature_ids is what makes the crop survivable downstream: a feature that produced no surviving
+#   dots is dropped from every one of these axes, so row i of feature_lengths is NOT map feature i
+#   of the scenario, and only the id says which lane a row actually is.
 def scenario_map_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
     signal_histories, signal_stop_points = scenario_traffic_signal_histories(scenario)
 
     feature_tables = []
+    feature_ids = []
+    feature_is_interpolating = []
+    feature_signal_histories = []
     for feature in scenario.map_features:
         rows = map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points)
-        if rows is not None:
-            feature_tables.append(rows)
+        if rows is None:
+            continue
+        feature_tables.append(rows)
+        feature_ids.append(feature.id)
+        feature_is_interpolating.append(map_feature_is_interpolating(feature))
+        feature_signal_histories.append(map_feature_signal_history(feature, signal_histories))
 
     if not feature_tables:
-        return np.zeros((0, contract.MAP_FEATURE_DIM)), np.zeros(0, dtype=np.int64)
+        return (
+            np.zeros((0, contract.MAP_FEATURE_DIM)),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros((0, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)),
+            np.zeros(0, dtype=bool),
+        )
 
     map_rows = np.concatenate(feature_tables)
     feature_lengths = np.array([len(table) for table in feature_tables], dtype=np.int64)
-    return map_rows, feature_lengths
+    return (
+        map_rows,
+        feature_lengths,
+        np.array(feature_ids, dtype=np.int64),
+        np.stack(feature_signal_histories),
+        np.array(feature_is_interpolating, dtype=bool),
+    )
+
+####    ------------------------------------------------------------- < LANE GRAPH >
+# Every lane's raw polyline, world frame, keyed by WOMD MapFeature.id. Built once per scenario
+# because a neighbour relation resolves indices into the OTHER lane's polyline, not its own, and a
+# neighbour is any lane in the scenario - including one the staging crop is about to delete.
+def lane_raw_polylines(scenario):
+    polylines = {}
+    for feature in scenario.map_features:
+        if feature.WhichOneof("feature_data") == "lane" and len(feature.lane.polyline) > 0:
+            polylines[feature.id] = np.array([[point.x, point.y] for point in feature.lane.polyline])
+    return polylines
+
+# One list of BoundarySegments -> its identity rows and its two world-frame endpoints per row.
+# WOMD puts these in two places and they are not the same fact: LaneCenter.left_boundaries /
+# right_boundaries describe what runs along a whole side of the lane, while LaneNeighbor.boundaries
+# describe what runs along the stretch shared with one named neighbour. shared_neighbour_lane_id
+# separates them. Both index THIS lane's polyline, so both resolve against the same points.
+def boundary_segment_rows(lane_id, shared_neighbour_lane_id, side_index, segments, lane_points):
+    identity_rows = []
+    endpoint_rows = []
+    for segment in segments:
+        assert 0 <= segment.lane_start_index < len(lane_points), (
+            f"boundary start {segment.lane_start_index} off lane {lane_id}"
+        )
+        assert 0 <= segment.lane_end_index < len(lane_points), (
+            f"boundary end {segment.lane_end_index} off lane {lane_id}"
+        )
+        assert segment.boundary_type < len(contract.ROAD_LINE_TYPES)
+        identity_rows.append([lane_id, shared_neighbour_lane_id, segment.boundary_feature_id,
+                              side_index, segment.boundary_type])
+        endpoint_rows.append(np.concatenate([lane_points[segment.lane_start_index],
+                                             lane_points[segment.lane_end_index]]))
+    return identity_rows, endpoint_rows
+
+# Rows of packed world (x, y) pairs -> the same rows in the storage frame. Flattened to one point
+# list, transformed once, folded back, so relation geometry goes through the identical affine
+# transform the map dots do rather than a second hand-written copy of it.
+def world_point_rows_to_storage_frame(packed_rows, row_width, origin, heading):
+    packed_points = np.array(packed_rows, dtype=np.float64).reshape(-1, 2)
+    reframed = frame_ops.positions_to_agent_frame(packed_points, origin, heading)
+    return reframed.reshape(-1, row_width)
+
+# Turns the lane relations WOMD ships into flat tables — the part of the map that says what a
+# driver is ALLOWED to do, which no arrangement of dots can express.
+#
+# Two decisions govern every table here, and both exist because of the crops.
+#
+#   IDS, NOT ROW NUMBERS. A relation names its lanes by WOMD MapFeature.id. Staging already drops
+#     features that produce no surviving dots, and the loader crops again per agent, so a row
+#     number into feature_lengths is true only at the crop that computed it. An id is resolvable at
+#     any crop, against feature_ids, and an id that resolves against nothing is the honest record
+#     of a lane the crop cut - the edge still says a lane is out there.
+#
+#   METRES, NOT POLYLINE INDICES. self_start_index, neighbor_end_index, lane_start_index and the
+#     rest all index the RAW polyline. points_along_polyline resamples that polyline to
+#     MAP_POINT_SPACING_METRES and the crop then deletes whatever falls outside
+#     STAGING_CROP_RADIUS_METRES, so proto index 37 is not row 37 of map_rows and no rewriting
+#     would keep it one through the loader's second crop. Each index is therefore RESOLVED here:
+#     read the raw point it names, put it in the storage frame, store the metres. A metre
+#     coordinate does not move when other dots are deleted, so the extent of a relation still means
+#     the same thing however hard anything downstream crops. These endpoints are NOT themselves
+#     cropped to STAGING_CROP_RADIUS_METRES: clipping them would silently shorten the stretch over
+#     which a lane change is legal.
+#
+# COMPLETED HERE — six tables, one row per relation, ids kept int64 and geometry float:
+#
+#  lane_connections (E, 3) int64                     entry_lanes = 9 / exit_lanes = 10
+#  ┌─────────┬─────────┬──────┐
+#  │ SOURCE  │  DEST   │ KIND │   both lists become source -> destination rows; KIND keeps which
+#  │ lane id │ lane id │ 0/1  │   list said so (0 entry, 1 exit) because either can name an edge
+#  └─────────┴─────────┴──────┘   the other omits
+#
+#  lane_neighbour_ids (N, 3) int64          lane_neighbour_bounds (N, 8) float
+#  ┌─────────┬─────────┬──────┐             ┌───────────┬───────────┬────────────┬────────────┐
+#  │  LANE   │  OTHER  │ SIDE │             │ SELF_START│  SELF_END │OTHER_START │ OTHER_END  │
+#  │ lane id │ lane id │ 0/1  │             │   x  y    │   x  y    │   x  y     │   x  y     │
+#  └─────────┴─────────┴──────┘             └───────────┴───────────┴────────────┴────────────┘
+#    SIDE: 0 left, 1 right                    where on THIS lane the two run alongside, and where
+#                                             on the OTHER lane a change into it lands
+#
+#  lane_boundary_ids (B, 5) int64                              lane_boundary_bounds (B, 4) float
+#  ┌─────────┬──────────┬──────────┬──────┬──────┐             ┌───────────┬───────────┐
+#  │  LANE   │  SHARED  │ BOUNDARY │ SIDE │ TYPE │             │   START   │    END    │
+#  │ lane id │ lane id  │ feat. id │ 0/1  │ line │             │   x  y    │   x  y    │
+#  │         │  or -1   │          │      │ type │             └───────────┴───────────┘
+#  └─────────┴──────────┴──────────┴──────┴──────┘               the stretch of THIS lane's
+#    SHARED = -1: the segment runs along the whole side          polyline the segment covers
+#      (left_boundaries = 13 / right_boundaries = 14)
+#    SHARED = a lane id: the segment runs along the stretch shared with that neighbour
+#      (LaneNeighbor.boundaries = 6) - a different fact, not a duplicate of the row above
+#    TYPE indexes ROAD_LINE_TYPES; the proto writes TYPE_UNKNOWN when the boundary is a road edge
+#
+#  stop_sign_controlled_lanes (S, 2) int64            StopSign.lane = 1
+#  ┌──────────┬─────────┐
+#  │ STOP SIGN│  LANE   │   one row per controlled lane. Without it the sign is an isolated dot and
+#  │ feat. id │ lane id │   nothing on disk says which approach it governs
+#  └──────────┴─────────┘
+#
+# Only features that survived staging get rows: the graph annotates the map that is in the file.
+# The lanes those rows POINT AT need not have survived, and often have not.
+def scenario_lane_graph_arrays(scenario, origin, heading, stored_feature_ids):
+    raw_polylines = lane_raw_polylines(scenario)
+
+    connection_rows = []
+    neighbour_identity_rows = []
+    neighbour_extent_rows = []
+    boundary_identity_rows = []
+    boundary_endpoint_rows = []
+    stop_sign_rows = []
+
+    for feature in scenario.map_features:
+        if feature.id not in stored_feature_ids:
+            continue
+        kind = feature.WhichOneof("feature_data")
+        if kind == "stop_sign":
+            for controlled_lane_id in feature.stop_sign.lane:
+                stop_sign_rows.append([feature.id, controlled_lane_id])
+            continue
+        if kind != "lane":
+            continue
+
+        lane_points = raw_polylines[feature.id]
+        for entry_lane_id in feature.lane.entry_lanes:
+            connection_rows.append(
+                [entry_lane_id, feature.id, contract.LANE_CONNECTION_KINDS.index("entry")]
+            )
+        for exit_lane_id in feature.lane.exit_lanes:
+            connection_rows.append(
+                [feature.id, exit_lane_id, contract.LANE_CONNECTION_KINDS.index("exit")]
+            )
+
+        for side_index, side_name in enumerate(contract.LANE_SIDES):
+            side_identities, side_endpoints = boundary_segment_rows(
+                feature.id,
+                contract.NO_SHARED_NEIGHBOUR_LANE,
+                side_index,
+                getattr(feature.lane, f"{side_name}_boundaries"),
+                lane_points,
+            )
+            boundary_identity_rows.extend(side_identities)
+            boundary_endpoint_rows.extend(side_endpoints)
+
+            for neighbour in getattr(feature.lane, f"{side_name}_neighbors"):
+                assert neighbour.feature_id in raw_polylines, (
+                    f"neighbour lane {neighbour.feature_id} of lane {feature.id}"
+                    f" absent from scenario {scenario.scenario_id}"
+                )
+                neighbour_points = raw_polylines[neighbour.feature_id]
+                assert 0 <= neighbour.self_start_index < len(lane_points)
+                assert 0 <= neighbour.self_end_index < len(lane_points)
+                assert 0 <= neighbour.neighbor_start_index < len(neighbour_points)
+                assert 0 <= neighbour.neighbor_end_index < len(neighbour_points)
+                neighbour_identity_rows.append([feature.id, neighbour.feature_id, side_index])
+                neighbour_extent_rows.append(np.concatenate([
+                    lane_points[neighbour.self_start_index],
+                    lane_points[neighbour.self_end_index],
+                    neighbour_points[neighbour.neighbor_start_index],
+                    neighbour_points[neighbour.neighbor_end_index],
+                ]))
+                shared_identities, shared_endpoints = boundary_segment_rows(
+                    feature.id, neighbour.feature_id, side_index, neighbour.boundaries, lane_points
+                )
+                boundary_identity_rows.extend(shared_identities)
+                boundary_endpoint_rows.extend(shared_endpoints)
+
+    return (
+        np.array(connection_rows, dtype=np.int64).reshape(-1, contract.LANE_CONNECTION_WIDTH),
+        np.array(neighbour_identity_rows, dtype=np.int64).reshape(-1, contract.LANE_NEIGHBOUR_ID_WIDTH),
+        world_point_rows_to_storage_frame(
+            neighbour_extent_rows, contract.LANE_NEIGHBOUR_BOUND_WIDTH, origin, heading
+        ),
+        np.array(boundary_identity_rows, dtype=np.int64).reshape(-1, contract.LANE_BOUNDARY_ID_WIDTH),
+        world_point_rows_to_storage_frame(
+            boundary_endpoint_rows, contract.LANE_BOUNDARY_BOUND_WIDTH, origin, heading
+        ),
+        np.array(stop_sign_rows, dtype=np.int64).reshape(-1, contract.STOP_SIGN_LANE_WIDTH),
+    )
 
 ## Write boundary: one scenario -> one .npz on disk. Float32 cast + compression live here and only here.
 # Returns the scenario's worst timestep-spacing deviation from 0.1 s. Measured on real data:
 # ~3% of scenarios have one skipped frame (gap ~0.2 s) or start-of-recording jitter, and Waymo
 # scores them like any other, so irregular spacing is COUNTED by the caller, never a veto.
+# The write lands on a .partial sibling and is renamed into place, so a staging session killed
+# part-way through leaves no truncated file wearing a legitimate scenario name among the rest.
+# savez_compressed is handed an open stream and never the partial PATH, because given a path it
+# appends .npz to anything not already ending in one and the file would land at <id>.npz.partial.npz.
 def write_scenario(scenario, output_path):
     assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
         f"current_time_index {scenario.current_time_index}, scenario {scenario.scenario_id}"
@@ -300,20 +543,37 @@ def write_scenario(scenario, output_path):
     worst_spacing_deviation = float(np.max(np.abs(timestamp_gaps - 0.1))) if len(timestamp_gaps) else 0.0
     track_rows, track_valid = scenario_track_arrays(scenario)
     track_ids, is_designated_target, is_object_of_interest = scenario_track_labels(scenario)
-    map_rows, feature_lengths = scenario_map_arrays(scenario)
+    (map_rows, feature_lengths, feature_ids, polyline_signal_histories,
+     feature_is_interpolating) = scenario_map_arrays(scenario)
     origin, heading = scenario_storage_frame(scenario)
-
-    np.savez_compressed(
-        output_path,
-        track_rows=track_rows.astype(np.float32),
-        track_valid=track_valid,
-        track_ids=track_ids,
-        is_designated_target=is_designated_target,
-        is_object_of_interest=is_object_of_interest,
-        map_rows=map_rows.astype(np.float32),
-        feature_lengths=feature_lengths,
-        frame_origin=origin.astype(np.float32),
-        frame_heading=np.float32(heading),
-        scenario_id=scenario.scenario_id,
+    (lane_connections, lane_neighbour_ids, lane_neighbour_bounds, lane_boundary_ids,
+     lane_boundary_bounds, stop_sign_controlled_lanes) = scenario_lane_graph_arrays(
+        scenario, origin, heading, set(feature_ids.tolist())
     )
+
+    partial_path = output_path.with_suffix(output_path.suffix + ".partial")
+    with open(partial_path, "wb") as partial_file:
+        np.savez_compressed(
+            partial_file,
+            track_rows=track_rows.astype(np.float32),
+            track_valid=track_valid,
+            track_ids=track_ids,
+            is_designated_target=is_designated_target,
+            is_object_of_interest=is_object_of_interest,
+            map_rows=map_rows.astype(np.float32),
+            feature_lengths=feature_lengths,
+            feature_ids=feature_ids,
+            feature_is_interpolating=feature_is_interpolating,
+            polyline_signal_histories=polyline_signal_histories.astype(np.float32),
+            lane_connections=lane_connections,
+            lane_neighbour_ids=lane_neighbour_ids,
+            lane_neighbour_bounds=lane_neighbour_bounds.astype(np.float32),
+            lane_boundary_ids=lane_boundary_ids,
+            lane_boundary_bounds=lane_boundary_bounds.astype(np.float32),
+            stop_sign_controlled_lanes=stop_sign_controlled_lanes,
+            frame_origin=origin.astype(np.float32),
+            frame_heading=np.float32(heading),
+            scenario_id=scenario.scenario_id,
+        )
+    partial_path.replace(output_path)
     return worst_spacing_deviation

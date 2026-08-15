@@ -44,12 +44,43 @@ def build_fixture_scenario(scenario_id):
         lane.lane.polyline.add(x=x, y=1.0)
     lane.lane.type = 2
     lane.lane.speed_limit_mph = 45.0
+    lane.lane.interpolating = True
+    lane.lane.entry_lanes.append(6)
+    lane.lane.exit_lanes.append(9)
+    left_boundary = lane.lane.left_boundaries.add()
+    left_boundary.lane_start_index = 0
+    left_boundary.lane_end_index = 1
+    left_boundary.boundary_feature_id = 8
+    left_boundary.boundary_type = 2
+
+    neighbour_lane = scenario.map_features.add()
+    neighbour_lane.id = 9
+    for x in (0.0, 10.0):
+        neighbour_lane.lane.polyline.add(x=x, y=4.0)
+    neighbour_lane.lane.type = 2
+    right_neighbour = lane.lane.right_neighbors.add()
+    right_neighbour.feature_id = 9
+    right_neighbour.self_start_index = 0
+    right_neighbour.self_end_index = 1
+    right_neighbour.neighbor_start_index = 0
+    right_neighbour.neighbor_end_index = 1
+    shared_boundary = right_neighbour.boundaries.add()
+    shared_boundary.lane_start_index = 0
+    shared_boundary.lane_end_index = 1
+    shared_boundary.boundary_feature_id = 8
+    shared_boundary.boundary_type = 1
 
     road_edge = scenario.map_features.add()
     road_edge.id = 8
     for x in (0.0, 50.0):
         road_edge.road_edge.polyline.add(x=x, y=-5.0)
     road_edge.road_edge.type = 1
+
+    stop_sign = scenario.map_features.add()
+    stop_sign.id = 10
+    stop_sign.stop_sign.position.x = 8.0
+    stop_sign.stop_sign.position.y = 1.0
+    stop_sign.stop_sign.lane.append(7)
 
     lane_state = scenario.dynamic_map_states.add().lane_states.add()
     lane_state.lane = 7

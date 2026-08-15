@@ -1,7 +1,7 @@
 import numpy as np
 
 from womd import contract, store
-from waymo_open_dataset.protos import map_pb2
+from waymo_open_dataset.protos import map_pb2, scenario_pb2
 
 WORLD_ORIGIN = np.zeros(2)
 WORLD_HEADING = 0.0
@@ -64,9 +64,10 @@ def test_map_rows_layout_for_all_seven_kinds():
         assert np.all(kind_block.sum(axis=1) == 1.0)
         assert np.all(kind_block[:, kind_index] == 1.0)
 
+        signal_history = store.map_feature_signal_history(feature, signal_histories)
         detail_block = rows[:, contract.MAP_KIND.stop:]
         if kind == "lane":
-            assert np.all(rows[:, contract.MAP_SIGNAL_STATE] == lane_signal_history.reshape(-1))
+            assert np.all(signal_history == lane_signal_history)
             assert np.all(rows[:, contract.MAP_LANE_TYPE.start + 2] == 1.0)
             assert np.all(rows[:, contract.MAP_SPEED_LIMIT] == 45.0)
             assert np.all(rows[:, contract.MAP_BOUNDARY_TYPE] == 0.0)
@@ -80,6 +81,7 @@ def test_map_rows_layout_for_all_seven_kinds():
                 contract.MAP_BOUNDARY_TYPE.start + len(contract.ROAD_LINE_TYPES) + 1
             ]
         else:
+            assert np.all(signal_history == 0.0)
             assert np.all(detail_block == 0.0)
             if kind == "stop_sign":
                 assert len(rows) == 1
@@ -119,6 +121,67 @@ def test_crop_keeps_polyline_crossing_the_boundary():
     )
 
 
+def test_lane_graph_resolves_raw_polyline_indices_not_resampled_rows():
+    lane = polyline_feature("lane", [(0.0, 0.0), (30.0, 0.0), (60.0, 0.0)], feature_id=11)
+    lane.lane.entry_lanes.append(14)
+    lane.lane.exit_lanes.append(13)
+    left_boundary = lane.lane.left_boundaries.add()
+    left_boundary.lane_start_index = 0
+    left_boundary.lane_end_index = 1
+    left_boundary.boundary_feature_id = 16
+    left_boundary.boundary_type = 2
+    right_neighbour = lane.lane.right_neighbors.add()
+    right_neighbour.feature_id = 12
+    right_neighbour.self_start_index = 1
+    right_neighbour.self_end_index = 2
+    right_neighbour.neighbor_start_index = 0
+    right_neighbour.neighbor_end_index = 2
+    shared_boundary = right_neighbour.boundaries.add()
+    shared_boundary.lane_start_index = 1
+    shared_boundary.lane_end_index = 2
+    shared_boundary.boundary_feature_id = 15
+    shared_boundary.boundary_type = 4
+
+    neighbour_lane = polyline_feature(
+        "lane", [(0.0, 3.0), (30.0, 3.0), (60.0, 3.0)], feature_id=12
+    )
+    stop_sign = map_pb2.MapFeature()
+    stop_sign.id = 20
+    stop_sign.stop_sign.position.x = 5.0
+    stop_sign.stop_sign.lane.extend([11, 13])
+
+    scenario = scenario_pb2.Scenario()
+    scenario.map_features.extend([lane, neighbour_lane, stop_sign])
+
+    (lane_connections, lane_neighbour_ids, lane_neighbour_bounds, lane_boundary_ids,
+     lane_boundary_bounds, stop_sign_controlled_lanes) = store.scenario_lane_graph_arrays(
+        scenario, WORLD_ORIGIN, WORLD_HEADING, {11, 12, 20}
+    )
+
+    assert lane_connections.tolist() == [[14, 11, 0], [11, 13, 1]]
+    assert lane_neighbour_ids.tolist() == [[11, 12, 1]]
+    assert lane_neighbour_bounds.tolist() == [[30.0, 0.0, 60.0, 0.0, 0.0, 3.0, 60.0, 3.0]]
+    assert lane_boundary_ids.tolist() == [[11, -1, 16, 0, 2], [11, 12, 15, 1, 4]]
+    assert lane_boundary_bounds.tolist() == [[0.0, 0.0, 30.0, 0.0], [30.0, 0.0, 60.0, 0.0]]
+    assert stop_sign_controlled_lanes.tolist() == [[20, 11], [20, 13]]
+
+
+def test_lane_graph_arrays_are_empty_and_correctly_shaped_without_relations():
+    scenario = scenario_pb2.Scenario()
+    scenario.map_features.append(polyline_feature("lane", [(0.0, 0.0), (10.0, 0.0)], feature_id=1))
+
+    graph_arrays = store.scenario_lane_graph_arrays(scenario, WORLD_ORIGIN, WORLD_HEADING, {1})
+    widths = (
+        contract.LANE_CONNECTION_WIDTH,
+        contract.LANE_NEIGHBOUR_ID_WIDTH,
+        contract.LANE_NEIGHBOUR_BOUND_WIDTH,
+        contract.LANE_BOUNDARY_ID_WIDTH,
+        contract.LANE_BOUNDARY_BOUND_WIDTH,
+        contract.STOP_SIGN_LANE_WIDTH,
+    )
+    assert [array.shape for array in graph_arrays] == [(0, width) for width in widths]
+
+
 def test_feature_row_layout_is_pinned():
-    assert contract.MAP_FEATURE_DIM == 129
+    assert contract.MAP_FEATURE_DIM == 30
     assert contract.AGENT_FEATURE_DIM == 13

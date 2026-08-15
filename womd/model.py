@@ -11,8 +11,9 @@ HIDDEN_DIM = 128
 
 # One divisor per feature column, applied before each encoder's first Linear. Every distance-like
 # column shares contract.DISTANCE_NORMALISER_METRES so geometry survives; a column with no
-# measured scale - heading cosine/sine, direction arrows, one-hots, the SDC flag, the signal-state
-# block - keeps a divisor of 1 and passes through untouched.
+# measured scale - heading cosine/sine, direction arrows, one-hots, the SDC flag - keeps a divisor
+# of 1 and passes through untouched. The signal history never reaches a divisor: it is one-hot and
+# it enters at the chunk token, past every per-dot and per-step encoder.
 def agent_feature_divisors():
     divisors = torch.ones(contract.AGENT_FEATURE_DIM)
     divisors[contract.AGENT_POSITION] = contract.DISTANCE_NORMALISER_METRES
@@ -24,7 +25,7 @@ def agent_feature_divisors():
 def map_feature_divisors():
     divisors = torch.ones(contract.MAP_FEATURE_DIM)
     divisors[contract.MAP_POSITION] = contract.DISTANCE_NORMALISER_METRES
-    divisors[contract.MAP_SPEED_LIMIT] = contract.SPEED_LIMIT_NORMALISER_METRES_PER_SECOND
+    divisors[contract.MAP_SPEED_LIMIT] = contract.SPEED_LIMIT_NORMALISER_MILES_PER_HOUR
     divisors[contract.MAP_STOP_POINT] = contract.DISTANCE_NORMALISER_METRES
     return divisors
 
@@ -145,12 +146,18 @@ class SceneAttentionLayer(nn.Module):
 # The whole scene as one token sequence: [predicted agent | neighbours | map dots], agent first.
 # Predicted agent and neighbours get separate encoder weights - different roles. A neighbour is
 # present if it has at least one valid snapshot; the agent is present by construction.
+# The chunk's traffic-signal history joins its map token here, after pooling, because the light is
+# the same on every dot of the lane the chunk was cut from. It is projected and ADDED rather than
+# concatenated: a projection carrying no bias sends the all-zero history of an unsignalled chunk to
+# an exact zero, so an absent slot's token stays the exact zero the pooling contract promises,
+# which a concatenation's bias term would lift off zero on every padded slot.
 class SceneEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.agent_encoder = AgentHistoryEncoder()
         self.neighbour_encoder = AgentHistoryEncoder()
         self.map_encoder = MapDotEncoder()
+        self.signal_projection = nn.Linear(contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False)
         self.layers = nn.ModuleList(SceneAttentionLayer() for _ in range(SCENE_ATTENTION_ROUNDS))
 
     def forward(self, batch):
@@ -159,6 +166,9 @@ class SceneEncoder(nn.Module):
         map_tokens, map_present = pool_dots_to_polyline_tokens(
             self.map_encoder(batch["map_rows"]), batch["map_dot_polyline_slot"],
             agent_token.shape[0], int(batch["max_polylines_in_batch"]),
+        )
+        map_tokens = map_tokens + self.signal_projection(
+            batch["map_chunk_signal_history"].flatten(start_dim=-2)
         )
 
         tokens = torch.cat([agent_token, neighbour_tokens, map_tokens], dim=1)
@@ -176,8 +186,11 @@ PRUNE_DISTANCE_METRES = 2.5
 
 # 64 learned queries, each a standing question the model owns. Each cross-attends over the
 # scene tokens and a SHARED head writes its trajectory + confidence - modes differ only by
-# their query vector, so query count is a config number. The head writes in the same normalised
-# units the encoders read; trajectories leave this module in metres.
+# their query vector, so query count is a config number. The head writes four numbers per future
+# step: two normalised position, then the heading as a cosine/sine PAIR rather than an angle, so
+# nothing downstream has to wrap. Only the position half is multiplied back into metres - a
+# cosine/sine pair is unit-scale already and dividing the encoders' distance normaliser into it
+# would inflate it by contract.DISTANCE_NORMALISER_METRES.
 class ModeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -187,7 +200,7 @@ class ModeDecoder(nn.Module):
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
-            nn.Linear(FEEDFORWARD_DIM, contract.FUTURE_STEPS * 2),
+            nn.Linear(FEEDFORWARD_DIM, contract.FUTURE_STEPS * 4),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
 
@@ -195,11 +208,15 @@ class ModeDecoder(nn.Module):
         batch_size = tokens.shape[0]
         queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
-        normalised_trajectories = self.trajectory_head(read).view(
-            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2
+        position_and_heading = self.trajectory_head(read).view(
+            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 4
         )
         confidence_logits = self.confidence_head(read).squeeze(-1)
-        return normalised_trajectories * contract.DISTANCE_NORMALISER_METRES, confidence_logits
+        return (
+            position_and_heading[..., :2] * contract.DISTANCE_NORMALISER_METRES,
+            position_and_heading[..., 2:],
+            confidence_logits,
+        )
 
 
 # Confidence-ordered endpoint pruning (MTR's reduction): walk modes by descending confidence,
@@ -223,9 +240,14 @@ def prune_modes(trajectories, confidence_logits):
     return trajectories[kept], confidence_logits[kept]
 
 
-# The same walk run for every sample at once. The walk stays sequential because the rule is
-# greedy, but each step is one batched comparison, so nothing forces a device synchronisation.
-def prune_modes_batched(trajectories, confidence_logits):
+# The same walk run for every sample at once, plus the count of modes each sample kept BEFORE
+# backfill - the mode-collapse detector, since a sample that keeps one mode emits six trajectories
+# of which five are duplicates. The walk stays sequential because the rule is greedy, but each step
+# is one batched comparison over the whole batch. It stops as soon as every sample has filled its
+# NUM_PREDICTED_MODES slots: from there on still_walking is false everywhere, so every remaining
+# step writes nothing. Reading that condition on the host is the walk's one device synchronisation
+# per step, and it buys the up-to-58 steps the early stop skips.
+def prune_modes_batched_with_kept_count(trajectories, confidence_logits):
     batch_size, mode_count = confidence_logits.shape
     device = trajectories.device
     endpoints = trajectories[:, :, -1]
@@ -258,6 +280,9 @@ def prune_modes_batched(trajectories, confidence_logits):
         dropped_indices = torch.where(drop_slot, candidate_index[:, None], dropped_indices)
         dropped_count = dropped_count + drops.long()
 
+        if bool((kept_count == contract.NUM_PREDICTED_MODES).all()):
+            break
+
     backfill_positions = (slot_positions[None, :] - kept_count[:, None]).clamp(min=0)
     final_indices = torch.where(
         slot_positions[None, :] < kept_count[:, None],
@@ -265,16 +290,36 @@ def prune_modes_batched(trajectories, confidence_logits):
         dropped_indices.gather(1, backfill_positions),
     )
     trajectory_selector = final_indices[:, :, None, None].expand(-1, -1, *trajectories.shape[2:])
-    return trajectories.gather(1, trajectory_selector), confidence_logits.gather(1, final_indices)
+    return (
+        trajectories.gather(1, trajectory_selector),
+        confidence_logits.gather(1, final_indices),
+        kept_count,
+    )
 
 
-# Training reads all 64 modes; prune_modes runs only at evaluation/submission.
+# The pruned pair on its own, for every caller that grades trajectories rather than watching the
+# walk: the metric accumulator, the null baselines and the submission path.
+def prune_modes_batched(trajectories, confidence_logits):
+    kept_trajectories, kept_confidence_logits, _ = prune_modes_batched_with_kept_count(
+        trajectories, confidence_logits
+    )
+    return kept_trajectories, kept_confidence_logits
+
+
+# Training reads all 64 modes; prune_modes runs only at evaluation/submission. forward keeps the
+# (trajectories in metres, confidence logits) pair the metric accumulator, the null baselines and
+# the submission path all speak; the auxiliary heading is a training-only output and is reached
+# through predict_with_heading, which the epoch loop calls instead.
 class MotionPredictor(nn.Module):
     def __init__(self):
         super().__init__()
         self.scene_encoder = SceneEncoder()
         self.mode_decoder = ModeDecoder()
 
-    def forward(self, batch):
+    def predict_with_heading(self, batch):
         tokens, token_present = self.scene_encoder(batch)
         return self.mode_decoder(tokens, token_present)
+
+    def forward(self, batch):
+        trajectories, _, confidence_logits = self.predict_with_heading(batch)
+        return trajectories, confidence_logits

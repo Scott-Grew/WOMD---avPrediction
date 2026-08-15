@@ -1,7 +1,19 @@
 {
+  "feature_ids": {
+    "shape": [
+      4
+    ],
+    "dtype": "int64"
+  },
+  "feature_is_interpolating": {
+    "shape": [
+      4
+    ],
+    "dtype": "bool"
+  },
   "feature_lengths": {
     "shape": [
-      2
+      4
     ],
     "dtype": "int64"
   },
@@ -27,16 +39,66 @@
     ],
     "dtype": "bool"
   },
+  "lane_boundary_bounds": {
+    "shape": [
+      2,
+      4
+    ],
+    "dtype": "float32"
+  },
+  "lane_boundary_ids": {
+    "shape": [
+      2,
+      5
+    ],
+    "dtype": "int64"
+  },
+  "lane_connections": {
+    "shape": [
+      2,
+      3
+    ],
+    "dtype": "int64"
+  },
+  "lane_neighbour_bounds": {
+    "shape": [
+      1,
+      8
+    ],
+    "dtype": "float32"
+  },
+  "lane_neighbour_ids": {
+    "shape": [
+      1,
+      3
+    ],
+    "dtype": "int64"
+  },
   "map_rows": {
     "shape": [
-      62,
-      129
+      74,
+      30
+    ],
+    "dtype": "float32"
+  },
+  "polyline_signal_histories": {
+    "shape": [
+      4,
+      11,
+      9
     ],
     "dtype": "float32"
   },
   "scenario_id": {
     "shape": [],
     "dtype": "<U8"
+  },
+  "stop_sign_controlled_lanes": {
+    "shape": [
+      1,
+      2
+    ],
+    "dtype": "int64"
   },
   "track_ids": {
     "shape": [

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from waymo_open_dataset.protos import scenario_pb2
-from womd import contract, frame_ops, loader, model, store, tfrecord
+from womd import baseline, contract, frame_ops, loader, model, store, tfrecord
 
 
 def test_crc32c_matches_known_answer():
@@ -94,11 +94,15 @@ def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
         "agent_history_mask": torch.ones(2, 11, dtype=torch.bool),
         "neighbour_history": torch.randn(2, 6, 11, 13),
         "neighbour_history_mask": torch.ones(2, 6, 11, dtype=torch.bool),
-        "map_rows": torch.randn(80, 129),
+        "map_rows": torch.randn(80, contract.MAP_FEATURE_DIM),
         "map_dot_polyline_slot": torch.arange(80) // 8,
+        "map_chunk_signal_history": torch.zeros(
+            2, 5, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
         "max_polylines_in_batch": torch.tensor(5),
     }
     batch["neighbour_history_mask"][:, 5] = False
+    batch["map_chunk_signal_history"][0, 1:3, :, 6] = 1.0
 
     neighbour_order = torch.randperm(6)
     map_order = torch.randperm(80)
@@ -132,3 +136,43 @@ def test_polyline_pooling_isolates_groups_and_leaves_empty_slots_absent():
     assert torch.equal(poisoned_tokens[0, 1:], tokens[0, 1:])
     assert torch.equal(poisoned_tokens[1], tokens[1])
     assert not torch.equal(poisoned_tokens[0, 0], tokens[0, 0])
+
+
+def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
+    step_offsets = np.arange(-contract.CURRENT_STEP_INDEX, contract.FUTURE_STEPS + 1)
+    elapsed = step_offsets * baseline.TIMESTEP_SECONDS
+    speeds = np.array([8.0, 0.0])
+    yaw_rates = np.array([0.3, 0.0])
+
+    turned = yaw_rates[:, None] * elapsed[None, :]
+    radii = np.where(yaw_rates == 0.0, 0.0, speeds / np.where(yaw_rates == 0.0, 1.0, yaw_rates))
+    arc_positions = np.stack(
+        [radii[:, None] * np.sin(turned), radii[:, None] * (1.0 - np.cos(turned))], axis=-1
+    )
+
+    agent_track = np.zeros((2, len(step_offsets), contract.AGENT_FEATURE_DIM), dtype=np.float32)
+    agent_track[..., contract.AGENT_POSITION] = arc_positions
+    agent_track[..., contract.AGENT_HEADING_COSINE] = np.cos(turned)
+    agent_track[..., contract.AGENT_HEADING_SINE] = np.sin(turned)
+    agent_track[..., contract.AGENT_VELOCITY] = speeds[:, None, None] * np.stack(
+        [np.cos(turned), np.sin(turned)], axis=-1
+    )
+
+    batch = {
+        "agent_history": torch.from_numpy(agent_track[:, :contract.HISTORY_STEPS]),
+        "agent_history_mask": torch.ones(2, contract.HISTORY_STEPS, dtype=torch.bool),
+    }
+    logged_future = torch.from_numpy(arc_positions[:, contract.HISTORY_STEPS:].astype(np.float32))
+
+    turning_trajectories, turning_logits = baseline.constant_turn_rate_and_velocity(batch)
+    straight_trajectories, _ = baseline.constant_velocity(batch)
+    assert turning_trajectories.shape == (2, 1, contract.FUTURE_STEPS, 2)
+    assert turning_logits.shape == (2, 1)
+
+    assert torch.allclose(turning_trajectories[:, 0], logged_future, atol=1e-3)
+    assert (straight_trajectories[0, 0, -1] - logged_future[0, -1]).norm() > 1.0
+    assert torch.all(turning_trajectories[1] == 0.0)
+    assert torch.all(straight_trajectories[1] == 0.0)
+
+    pruned, _ = model.prune_modes_batched(turning_trajectories, turning_logits)
+    assert torch.equal(pruned, turning_trajectories.expand(-1, contract.NUM_PREDICTED_MODES, -1, -1))

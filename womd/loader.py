@@ -59,25 +59,46 @@ def track_rows_to_agent_frame(rows, origin, heading):
     reframed[..., contract.AGENT_HEADING_SINE] = heading_sine * rotation_cosine - heading_cosine * rotation_sine
     return reframed
 
-def crop_and_reframe_map(map_rows, dot_polyline_index, dot_has_traffic_signal, origin, heading, speed):
+# Crop the map to the agent's view, reframe it, and cut the surviving dots into the chunks that
+# become attention tokens: at most contract.MAP_CHUNK_DOTS consecutive dots of one polyline, so a
+# token summarises a bounded stretch of road instead of a whole polyline of any length. Chunking
+# follows the crop, so a polyline that survives in part is cut by its surviving dots. Chunk indices
+# run 0..chunk count - 1 with no gaps, and a chunk's dots stay contiguous in the returned rows.
+# The signal history is per polyline, so every chunk cut from a polyline is handed that polyline's
+# history - the dots never carry it, and the model attaches it after pooling.
+def crop_and_reframe_map(map_rows, dot_polyline_index, polyline_signal_histories, origin, heading, speed):
     agent_frame_positions = frame_ops.positions_to_agent_frame(map_rows[:, contract.MAP_POSITION], origin, heading)
     crop_mask = inside_crop(agent_frame_positions, BASE_RADIUS_METRES, 1.0 + STRETCH_GAIN * speed)
     reframed = map_rows[crop_mask]
     reframed[:, contract.MAP_POSITION] = agent_frame_positions[crop_mask]
     reframed[:, contract.MAP_DIRECTION] = frame_ops.directions_to_agent_frame(reframed[:, contract.MAP_DIRECTION], heading)
-    has_signal = dot_has_traffic_signal[crop_mask]
+    has_signal = polyline_signal_histories.any(axis=(1, 2))[dot_polyline_index[crop_mask]]
     reframed[has_signal, contract.MAP_STOP_POINT] = frame_ops.positions_to_agent_frame(reframed[has_signal, contract.MAP_STOP_POINT], origin, heading)
-    surviving_polylines, compact_polyline_index = np.unique(
-        dot_polyline_index[crop_mask], return_inverse=True
+    surviving_polylines, first_dot_position, compact_polyline_index, dots_per_polyline = np.unique(
+        dot_polyline_index[crop_mask], return_index=True, return_inverse=True, return_counts=True
     )
-    return reframed, compact_polyline_index
+    position_within_polyline = np.arange(len(compact_polyline_index)) - first_dot_position[compact_polyline_index]
+    chunks_per_polyline = (dots_per_polyline + contract.MAP_CHUNK_DOTS - 1) // contract.MAP_CHUNK_DOTS
+    first_chunk_of_polyline = np.cumsum(chunks_per_polyline) - chunks_per_polyline
+    dot_chunk_index = (first_chunk_of_polyline[compact_polyline_index]
+                       + position_within_polyline // contract.MAP_CHUNK_DOTS)
+    chunk_signal_history = polyline_signal_histories[np.repeat(surviving_polylines, chunks_per_polyline)]
+    return reframed, dot_chunk_index, chunk_signal_history
 
+# feature_lengths is the ONLY thing tying a dot back to the polyline it came from: the dots are one
+# flat block and the lengths cut it. A staging bug that leaves the two out of step shifts every dot
+# after the first bad polyline onto a neighbour's identity, which the model reads as a plausible map
+# and the loss descends against without any signature at all, so the agreement is checked on read.
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
         scenario_array = {name: scenario_file[name] for name in scenario_file.files}
     feature_lengths = scenario_array["feature_lengths"]
+    map_row_count = len(scenario_array["map_rows"])
+    assert feature_lengths.sum() == map_row_count, (
+        f"feature_lengths sum to {feature_lengths.sum()} but {scenario_path} holds"
+        f" {map_row_count} map rows"
+    )
     scenario_array["map_dot_polyline_index"] = np.repeat(np.arange(len(feature_lengths)), feature_lengths)
-    scenario_array["map_dot_has_traffic_signal"] = scenario_array["map_rows"][:, contract.MAP_SIGNAL_STATE].any(axis=1)
     return scenario_array
 
 def build_sample(scenario_array, track_index):
@@ -94,10 +115,10 @@ def build_sample(scenario_array, track_index):
     )
 
     speed = float(np.linalg.norm(track_rows[track_index, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY]))
-    agent_map, map_polyline_index = crop_and_reframe_map(
+    agent_map, map_chunk_index, map_chunk_signal_history = crop_and_reframe_map(
         scenario_array["map_rows"],
         scenario_array["map_dot_polyline_index"],
-        scenario_array["map_dot_has_traffic_signal"],
+        scenario_array["polyline_signal_histories"],
         origin,
         heading,
         speed,
@@ -107,11 +128,13 @@ def build_sample(scenario_array, track_index):
         "agent_history": agent_track[:contract.HISTORY_STEPS],
         "agent_history_mask": track_valid[track_index, :contract.HISTORY_STEPS],
         "future_positions": future_positions,
+        "future_headings": agent_track[contract.CURRENT_STEP_INDEX + 1:, contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
         "future_mask": track_valid[track_index, contract.CURRENT_STEP_INDEX + 1:],
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": track_valid[neighbour_indices, :contract.HISTORY_STEPS],
         "map_rows": agent_map,
-        "map_polyline_index": map_polyline_index.astype(np.int64),
+        "map_chunk_index": map_chunk_index.astype(np.int64),
+        "map_chunk_signal_history": map_chunk_signal_history,
         "frame_origin": origin,
         "frame_heading": heading,
         "scenario_id": scenario_array["scenario_id"],
@@ -120,15 +143,17 @@ def build_sample(scenario_array, track_index):
         "is_object_of_interest": scenario_array["is_object_of_interest"][track_index],
     }
 
-# Only the neighbour and polyline axes are padded to a common width. The map dots stay ragged:
+# Only the neighbour and chunk axes are padded to a common width - the chunk signal histories
+# pad on the chunk axis with the zeros an unsignalled chunk already carries. The map dots stay ragged:
 # every sample's dots are concatenated into one flat block, and each dot carries the global
-# polyline slot (sample_index * max_polylines_in_batch + polyline index within the sample) it
-# pools into, so the dot axis never pays for the batch's largest crop.
+# chunk slot (sample_index * max_chunks_in_batch + chunk index within the sample) it pools
+# into, so the dot axis never pays for the batch's largest crop. The slot and width keep the
+# names the model reads them under.
 def build_batch(samples):
     batch_size = len(samples)
     max_neighbours = max(sample["neighbour_history"].shape[0] for sample in samples)
-    max_polylines_in_batch = max(
-        int(sample["map_polyline_index"].max()) + 1 if len(sample["map_polyline_index"]) else 0
+    max_chunks_in_batch = max(
+        int(sample["map_chunk_index"].max()) + 1 if len(sample["map_chunk_index"]) else 0
         for sample in samples
     )
 
@@ -136,16 +161,23 @@ def build_batch(samples):
         (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
     )
     neighbour_history_mask = np.zeros((batch_size, max_neighbours, contract.HISTORY_STEPS), dtype=bool)
+    map_chunk_signal_history = np.zeros(
+        (batch_size, max_chunks_in_batch, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        dtype=np.float32,
+    )
 
     for sample_index, sample in enumerate(samples):
         neighbour_count = sample["neighbour_history"].shape[0]
         neighbour_history[sample_index, :neighbour_count] = sample["neighbour_history"]
         neighbour_history_mask[sample_index, :neighbour_count] = sample["neighbour_history_mask"]
+        chunk_count = sample["map_chunk_signal_history"].shape[0]
+        map_chunk_signal_history[sample_index, :chunk_count] = sample["map_chunk_signal_history"]
 
     return {
         "agent_history": np.stack([sample["agent_history"] for sample in samples]),
         "agent_history_mask": np.stack([sample["agent_history_mask"] for sample in samples]),
         "future_positions": np.stack([sample["future_positions"] for sample in samples]),
+        "future_headings": np.stack([sample["future_headings"] for sample in samples]),
         "future_mask": np.stack([sample["future_mask"] for sample in samples]),
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": neighbour_history_mask,
@@ -154,10 +186,11 @@ def build_batch(samples):
         ),
         "map_dot_polyline_slot": np.concatenate(
             [
-                sample["map_polyline_index"] + sample_index * max_polylines_in_batch
+                sample["map_chunk_index"] + sample_index * max_chunks_in_batch
                 for sample_index, sample in enumerate(samples)
             ],
             dtype=np.int64,
         ),
-        "max_polylines_in_batch": np.array(max_polylines_in_batch, dtype=np.int64),
+        "map_chunk_signal_history": map_chunk_signal_history,
+        "max_polylines_in_batch": np.array(max_chunks_in_batch, dtype=np.int64),
     }

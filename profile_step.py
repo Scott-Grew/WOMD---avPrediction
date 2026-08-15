@@ -168,7 +168,7 @@ def time_build_sample_stages(timer, scenario_arrays, track_index):
     loader.crop_and_reframe_map(
         scenario_arrays["map_rows"],
         scenario_arrays["map_dot_polyline_index"],
-        scenario_arrays["map_dot_has_traffic_signal"],
+        scenario_arrays["polyline_signal_histories"],
         origin,
         heading,
         speed,
@@ -185,12 +185,13 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
 
     with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
         timer.start("forward")
-        trajectories, confidence_logits = predictor(batch)
+        trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
         timer.stop("forward")
 
         timer.start("loss")
-        total, _, _ = loss.prediction_loss(
-            trajectories, confidence_logits, batch["future_positions"], batch["future_mask"]
+        total, _, _, _ = loss.prediction_loss(
+            trajectories, heading_cosine_sine, confidence_logits,
+            batch["future_positions"], batch["future_headings"], batch["future_mask"], 1.0
         )
         timer.stop("loss")
 
