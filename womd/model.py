@@ -58,14 +58,23 @@ class MapDotEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.register_buffer("feature_divisors", map_feature_divisors())
+        input_width = (contract.MAP_FEATURE_DIM - 2) + 2 * contract.NUM_BOUNDARY_CROSSING_CODES
         self.network = nn.Sequential(
-            nn.Linear(contract.MAP_FEATURE_DIM, HIDDEN_DIM),
+            nn.Linear(input_width, HIDDEN_DIM),
             nn.ReLU(),
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
         )
 
     def forward(self, map_rows):
-        return self.network(map_rows / self.feature_divisors)
+        scaled = map_rows / self.feature_divisors
+        crossing_codes = map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:].long()
+        crossing_one_hot = nn.functional.one_hot(
+            crossing_codes, contract.NUM_BOUNDARY_CROSSING_CODES
+        ).flatten(start_dim=-2)
+        return self.network(torch.cat(
+            [scaled[:, :contract.MAP_LEFT_BOUNDARY_CROSSING], crossing_one_hot.to(scaled.dtype)],
+            dim=-1,
+        ))
 
 
 # One token per POLYLINE, not per dot (§34 token-count recomputation, 2026-08-14: measured
@@ -158,6 +167,7 @@ class SceneEncoder(nn.Module):
         self.neighbour_encoder = AgentHistoryEncoder()
         self.map_encoder = MapDotEncoder()
         self.signal_projection = nn.Linear(contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False)
+        self.lane_context_projection = nn.Linear(contract.LANE_CONTEXT_DIM, HIDDEN_DIM, bias=False)
         self.layers = nn.ModuleList(SceneAttentionLayer() for _ in range(SCENE_ATTENTION_ROUNDS))
 
     def forward(self, batch):
@@ -167,8 +177,10 @@ class SceneEncoder(nn.Module):
             self.map_encoder(batch["map_rows"]), batch["map_dot_polyline_slot"],
             agent_token.shape[0], int(batch["max_polylines_in_batch"]),
         )
-        map_tokens = map_tokens + self.signal_projection(
-            batch["map_chunk_signal_history"].flatten(start_dim=-2)
+        map_tokens = (
+            map_tokens
+            + self.signal_projection(batch["map_chunk_signal_history"].flatten(start_dim=-2))
+            + self.lane_context_projection(batch["map_chunk_lane_context"])
         )
 
         tokens = torch.cat([agent_token, neighbour_tokens, map_tokens], dim=1)
@@ -200,21 +212,28 @@ def agent_reachable_distance(agent_history):
     )
 
 
-# The head's position pair is a FRACTION of that distance rather than a position, so a future the
-# agent could not reach is unrepresentable instead of penalised - no loss term, no weight, no
-# number to choose. The squash runs on the pair's LENGTH, not on its two columns: squashing the
-# columns independently would fence a square of side twice the bound, whose corner sits 1.414x
-# outside it, and the bound is a radius, so the fence has to be that radius' disc. The bound is the
-# horizon's, applied at every step, because the acceleration limit under it was measured at a 0.5 s
-# window and §LIMITS rules limit and window inseparable; re-evaluating it at one 0.1 s step reads
-# the differentiation noise that window exists to remove, and measured over 39,259 logged steps a
-# step-scaled bound cuts 224 of them. tanh(length) / length approaches 1 as the length goes to
-# zero, so a short trajectory sits in the linear part of the map and costs no resolution, and
-# flooring the divisor at the dtype's own eps keeps the exactly zero pair finite.
-def fence_to_reachable_disc(raw_position, reachable_distance_metres):
-    length = raw_position.norm(dim=-1, keepdim=True)
-    fenced_length = torch.tanh(length) * reachable_distance_metres.view(-1, 1, 1, 1)
-    return raw_position * fenced_length / length.clamp_min(torch.finfo(raw_position.dtype).eps)
+# The head's whole trajectory is a FRACTION of that distance rather than a set of positions, so a
+# future the agent could not drive is unrepresentable instead of penalised - no loss term, no
+# weight, no number to choose. The budget is spent on the PATH the trajectory traces, not on how
+# far its endpoint lands: displacement never exceeds arc length, so bounding the path bounds the
+# endpoint too, while the endpoint form permits a mode to reach the 8 s radius at 2 s and come back
+# for free. The first step's contribution is measured from the origin because the agent sits there
+# at "now" by construction of the sample frame. The bound is the horizon's, applied to the whole
+# path, because the acceleration limit under it was measured at a 0.5 s window and §LIMITS rules
+# limit and window inseparable; re-evaluating it at one 0.1 s step reads the differentiation noise
+# that window exists to remove. Integrating a 0.5 s-window limit over 8 s errs conservative -
+# §LIMITS measures the limit FALLING as the window widens. Measured over 1,278 logged futures the
+# path form clips none of them, at a worst use of 0.894 of the budget against the endpoint form's
+# 0.712, so it constrains strictly harder while still never touching a real future. One scale
+# multiplies every position, so the trajectory's shape survives and only its size is bounded;
+# tanh(length) / length approaches 1 as the length goes to zero, so a short path sits in the linear
+# part of the map and costs no resolution, and flooring the divisor at the dtype's own eps keeps
+# the exactly zero path finite.
+def fence_to_reachable_path_length(raw_position, reachable_distance_metres):
+    steps = torch.cat([raw_position[..., :1, :], raw_position.diff(dim=-2)], dim=-2)
+    path_length = steps.norm(dim=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
+    fenced_length = torch.tanh(path_length) * reachable_distance_metres.view(-1, 1, 1, 1)
+    return raw_position * fenced_length / path_length.clamp_min(torch.finfo(raw_position.dtype).eps)
 
 
 # QUERY_COUNT learned queries, each a standing question the model owns. Each cross-attends over the
@@ -245,7 +264,7 @@ class ModeDecoder(nn.Module):
         )
         confidence_logits = self.confidence_head(read).squeeze(-1)
         return (
-            fence_to_reachable_disc(position_and_heading[..., :2], reachable_distance_metres),
+            fence_to_reachable_path_length(position_and_heading[..., :2], reachable_distance_metres),
             position_and_heading[..., 2:],
             confidence_logits,
         )

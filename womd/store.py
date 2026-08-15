@@ -131,17 +131,20 @@ def map_feature_points(feature):
 # Walk the shape from start to end -> read one per-point column at every dot dropped along the way.
 # The walk is parameterised by arc length, so a dot lands every MAP_POINT_SPACING_METRES of travel
 # and reads whatever the column held at that distance.
+def polyline_arc_lengths(points):
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+def polyline_sample_distances(arc_lengths, spacing):
+    return np.append(np.arange(0.0, arc_lengths[-1], spacing), arc_lengths[-1])
+
 def column_along_polyline(points, column_values, spacing):
     if len(points) < 2:
         return column_values
-    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    arc_lengths = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    total_length = arc_lengths[-1]
-    if total_length == 0.0:
+    arc_lengths = polyline_arc_lengths(points)
+    if arc_lengths[-1] == 0.0:
         return column_values[:1]
-    sample_distances = np.arange(0.0, total_length, spacing)
-    sample_distances = np.append(sample_distances, total_length)
-    return np.interp(sample_distances, arc_lengths, column_values)
+    return np.interp(polyline_sample_distances(arc_lengths, spacing), arc_lengths, column_values)
 
 # Walk the shape from start to end -> drop a new dot every MAP_POINT_SPACING_METRES -> 2d-array.
 def points_along_polyline(points, spacing):
@@ -166,18 +169,32 @@ def polyline_directions(points):
         directions[zero_index] = directions[zero_index - 1]
     return np.concatenate([directions, directions[-1:]])
 
-# Runs a feature through all above methods -> places them in ego/sdc coordiantes 
+def map_feature_boundary_crossing_codes(feature, raw_points, dot_count):
+    crossing_codes = np.zeros((dot_count, 2))
+    if feature.WhichOneof("feature_data") != "lane":
+        return crossing_codes
+    arc_lengths = polyline_arc_lengths(raw_points)
+    sample_distances = polyline_sample_distances(arc_lengths, contract.MAP_POINT_SPACING_METRES)
+    for side_index, side_name in enumerate(contract.LANE_SIDES):
+        for segment in getattr(feature.lane, f"{side_name}_boundaries"):
+            first_dot = np.searchsorted(sample_distances, arc_lengths[segment.lane_start_index], side="left")
+            last_dot = np.searchsorted(sample_distances, arc_lengths[segment.lane_end_index], side="right")
+            crossing_codes[first_dot:last_dot, side_index] = 1.0 + segment.boundary_type
+    return crossing_codes
+
+# Runs a feature through all above methods -> places them in ego/sdc coordiantes
 # -> drops those outside STAGING_CROP_RADIUS_METRES./contract.py
 def map_feature_to_storage_frame(feature, origin, heading):
     raw_points, kind_index = map_feature_points(feature)
     if raw_points is None:
-        return None, None, None
+        return None, None, None, None
     spaced_points = points_along_polyline(raw_points, contract.MAP_POINT_SPACING_METRES)
     arrows = polyline_directions(spaced_points)
+    crossing_codes = map_feature_boundary_crossing_codes(feature, raw_points, len(spaced_points))
     stored_points = frame_ops.positions_to_agent_frame(spaced_points, origin, heading)
     stored_arrows = frame_ops.directions_to_agent_frame(arrows, heading)
     keep = np.linalg.norm(stored_points, axis=1) <= contract.STAGING_CROP_RADIUS_METRES
-    return stored_points[keep], stored_arrows[keep], kind_index
+    return stored_points[keep], stored_arrows[keep], crossing_codes[keep], kind_index
 
 # Traffic signal look-up/define: 1 second history -> now
 # Hotspot approach , 11(timestamp) x 9(state)
@@ -200,7 +217,7 @@ def scenario_traffic_signal_histories(scenario):
             )
     return histories, stop_points
 
-# FLAG: # Joins everything built above into one finished N x 30 table for a single feature: geometry in every row,
+# FLAG: # Joins everything built above into one finished N x 32 table for a single feature: geometry in every row,
 #   kind one-hot, then the detail blocks only that kind fills (lane -> type/speed/stop point, line/edge -> boundary type).
 # N (dots per feature) stays ragged on purpose: staging stores the world complete; the loader crops/rotates per
 #   predicted agent at train time, where the choice costs a flag instead of a restage.
@@ -209,22 +226,22 @@ def scenario_traffic_signal_histories(scenario):
 # The scenario is the unit of storage; the sample is the unit of training
 #   WOMD Leaderboard asks for 8.
 #
-# The final matrix — map_rows (N_total, 30), one contiguous block of rows per feature:
+# The final matrix — map_rows (N_total, 32), one contiguous block of rows per feature:
 #
-#                   0  1   2  3    4 .. 10    11-14    15    16 .. 24   25-27   28-29
-#                ┌───────┬───────┬─────────┬─────────┬─────┬────────────┬────────┬───────┐
-#                │  POS  │  DIR  │  KIND   │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │ STOP  │
-#                │  x  y │ dx dy │1-hot of7│1-hot of4│ mph │ 9 road_line│3 r_edge│ sx sy │
-#                ├───────┼───────┼─────────┼─────────┼─────┼────────────┼────────┼───────┤
-# lane           │  x  y │ dx dy │  1 @ 4  │  1-hot  │ mph │     0      │   0    │ sx sy │
-# road_line      │  x  y │ dx dy │  1 @ 5  │    0    │  0  │ 1-hot of 9 │   0    │  0 0  │
-# road_edge      │  x  y │ dx dy │  1 @ 6  │    0    │  0  │     0      │1-hot/3 │  0 0  │
-# stop_sign      │  x  y │  0  0 │  1 @ 7  │    0    │  0  │     0      │   0    │  0 0  │
-# crosswalk      │  x  y │ dx dy │  1 @ 8  │    0    │  0  │     0      │   0    │  0 0  │
-# speed_bump     │  x  y │ dx dy │  1 @ 9  │    0    │  0  │     0      │   0    │  0 0  │
-# driveway       │  x  y │ dx dy │ 1 @ 10  │    0    │  0  │     0      │   0    │  0 0  │
-#                │   :   │   :   │    :    │    :    │  :  │     :      │   :    │   :   │
-#                └───────┴───────┴─────────┴─────────┴─────┴────────────┴────────┴───────┘
+#                   0  1   2  3    4 .. 10    11-14    15    16 .. 24   25-27   28-29   30-31
+#                ┌───────┬───────┬─────────┬─────────┬─────┬────────────┬────────┬───────┬───────┐
+#                │  POS  │  DIR  │  KIND   │LANE_TYPE│ SPD │    BOUNDARY_TYPE    │ STOP  │ CROSS │
+#                │  x  y │ dx dy │1-hot of7│1-hot of4│ mph │ 9 road_line│3 r_edge│ sx sy │ lf rt │
+#                ├───────┼───────┼─────────┼─────────┼─────┼────────────┼────────┼───────┼───────┤
+# lane           │  x  y │ dx dy │  1 @ 4  │  1-hot  │ mph │     0      │   0    │ sx sy │ lf rt │
+# road_line      │  x  y │ dx dy │  1 @ 5  │    0    │  0  │ 1-hot of 9 │   0    │  0 0  │  0 0  │
+# road_edge      │  x  y │ dx dy │  1 @ 6  │    0    │  0  │     0      │1-hot/3 │  0 0  │  0 0  │
+# stop_sign      │  x  y │  0  0 │  1 @ 7  │    0    │  0  │     0      │   0    │  0 0  │  0 0  │
+# crosswalk      │  x  y │ dx dy │  1 @ 8  │    0    │  0  │     0      │   0    │  0 0  │  0 0  │
+# speed_bump     │  x  y │ dx dy │  1 @ 9  │    0    │  0  │     0      │   0    │  0 0  │  0 0  │
+# driveway       │  x  y │ dx dy │ 1 @ 10  │    0    │  0  │     0      │   0    │  0 0  │  0 0  │
+#                │   :   │   :   │    :    │    :    │  :  │     :      │   :    │   :   │   :   │
+#                └───────┴───────┴─────────┴─────────┴─────┴────────────┴────────┴───────┴───────┘
 #                  ↑ one row = one dot, MAP_POINT_SPACING_METRES apart
 #
 # Rows: features stay contiguous in scenario.map_features order (kinds interleave — one band per
@@ -235,8 +252,16 @@ def scenario_traffic_signal_histories(scenario):
 # STOP [28:30]: signalised lanes only — the signal's stop point in the storage frame, same pair
 #   on every dot of that lane; zeros everywhere else (an unsignalled lane has no stop point). It
 #   stays per dot because it is geometry the dot encoder reads against that dot's own position.
+# CROSS [30:32]: lanes only — the BoundarySegment covering this dot on its left and on its right,
+#   as a CODE not a one-hot, since a dot has at most one boundary per side. 0 = no segment covers
+#   this dot on that side; a recorded type is 1 + its index into BOUNDARY_TYPES, keeping "absent"
+#   distinct from BOUNDARY_TYPES[0] = TYPE_UNKNOWN. lane_start_index / lane_end_index name RAW
+#   polyline points, so they are read as arc lengths and matched against each resampled dot's own
+#   sample distance, never scaled. Overlapping segments: proto order, last one wins.
 def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points):
-    stored_points, stored_arrows, kind_index = map_feature_to_storage_frame(feature, origin, heading)
+    stored_points, stored_arrows, crossing_codes, kind_index = map_feature_to_storage_frame(
+        feature, origin, heading
+    )
     if stored_points is None or len(stored_points) == 0:
         return None
     kind = contract.MAP_POLYLINE_KINDS[kind_index]
@@ -245,6 +270,8 @@ def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_poi
     rows[:, contract.MAP_POSITION] = stored_points
     rows[:, contract.MAP_DIRECTION] = stored_arrows
     rows[:, contract.MAP_KIND.start + kind_index] = 1.0
+    rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING] = crossing_codes[:, 0]
+    rows[:, contract.MAP_RIGHT_BOUNDARY_CROSSING] = crossing_codes[:, 1]
 
     if kind == "lane":
         if feature.id in signal_histories:
@@ -279,7 +306,7 @@ def map_feature_is_interpolating(feature):
 
 # Turns a whole scenario's map into one packed thing
 #
-# COMPLETED HERE — the map matrix, map_rows (N_total, 30): every feature's row-table from
+# COMPLETED HERE — the map matrix, map_rows (N_total, 32): every feature's row-table from
 #   map_feature_rows (diagram above), stacked top to bottom in scenario.map_features order.
 #   feature_lengths (F,) int64 records each block's height; cumsum recovers the boundaries.
 #

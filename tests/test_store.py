@@ -90,7 +90,7 @@ def test_map_rows_layout_for_all_seven_kinds():
 
 def test_fill_bridges_measured_worst_case_shapes():
     endpoint_pair_edge = polyline_feature("road_edge", [(0.0, 0.0), (159.8, 0.0)])
-    edge_points, edge_arrows, _ = store.map_feature_to_storage_frame(
+    edge_points, edge_arrows, _, _ = store.map_feature_to_storage_frame(
         endpoint_pair_edge, WORLD_ORIGIN, WORLD_HEADING
     )
     assert len(edge_points) == int(np.ceil(159.8 / contract.MAP_POINT_SPACING_METRES)) + 1
@@ -101,7 +101,7 @@ def test_fill_bridges_measured_worst_case_shapes():
     corners_only_crosswalk = polygon_feature(
         "crosswalk", [(0.0, 0.0), (62.0, 0.0), (62.0, 62.0), (0.0, 62.0)]
     )
-    ring_points, _, _ = store.map_feature_to_storage_frame(
+    ring_points, _, _, _ = store.map_feature_to_storage_frame(
         corners_only_crosswalk, WORLD_ORIGIN, WORLD_HEADING
     )
     ring_gaps = np.linalg.norm(np.diff(ring_points, axis=0), axis=1)
@@ -111,7 +111,7 @@ def test_fill_bridges_measured_worst_case_shapes():
 
 def test_crop_keeps_polyline_crossing_the_boundary():
     crossing_edge = polyline_feature("road_edge", [(-300.0, 1.0), (300.0, 1.0)])
-    stored_points, stored_arrows, _ = store.map_feature_to_storage_frame(
+    stored_points, stored_arrows, _, _ = store.map_feature_to_storage_frame(
         crossing_edge, WORLD_ORIGIN, WORLD_HEADING
     )
     assert len(stored_points) > 600.0 / contract.MAP_POINT_SPACING_METRES * 0.9
@@ -119,6 +119,25 @@ def test_crop_keeps_polyline_crossing_the_boundary():
     assert np.all(
         np.linalg.norm(stored_points, axis=1) <= contract.STAGING_CROP_RADIUS_METRES
     )
+
+
+def test_boundary_crossing_codes_resolve_raw_indices_through_resampling():
+    lane = polyline_feature(
+        "lane", [(0.0, 0.0), (10.0, 0.0), (30.0, 0.0), (60.0, 0.0)], feature_id=21
+    )
+    left_boundary = lane.lane.left_boundaries.add()
+    left_boundary.lane_start_index = 1
+    left_boundary.lane_end_index = 2
+    left_boundary.boundary_feature_id = 31
+    left_boundary.boundary_type = 3
+
+    rows = store.map_feature_rows(lane, WORLD_ORIGIN, WORLD_HEADING, {}, {})
+    left_codes = rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING]
+
+    assert len(rows) == int(60.0 / contract.MAP_POINT_SPACING_METRES) + 1
+    assert np.flatnonzero(left_codes).tolist() == list(range(10, 31))
+    assert np.all(left_codes[10:31] == 1 + 3)
+    assert np.all(rows[:, contract.MAP_RIGHT_BOUNDARY_CROSSING] == 0.0)
 
 
 def test_lane_graph_resolves_raw_polyline_indices_not_resampled_rows():
@@ -183,5 +202,5 @@ def test_lane_graph_arrays_are_empty_and_correctly_shaped_without_relations():
 
 
 def test_feature_row_layout_is_pinned():
-    assert contract.MAP_FEATURE_DIM == 30
+    assert contract.MAP_FEATURE_DIM == 32
     assert contract.AGENT_FEATURE_DIM == 13

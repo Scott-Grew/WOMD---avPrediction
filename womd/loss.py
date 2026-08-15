@@ -28,9 +28,53 @@ import torch
 MODE_CLASSIFICATION_WEIGHT = 1.0
 
 
+def nearest_drivable_dot_index(query_positions, drivable_positions, drivable_mask):
+    separations = torch.cdist(query_positions, drivable_positions)
+    separations.masked_fill_(~drivable_mask.unsqueeze(1), float("inf"))
+    return separations.argmin(dim=-1)
+
+
+def gather_drivable_dots(drivable_positions, dot_indices):
+    return drivable_positions.gather(1, dot_indices.unsqueeze(-1).expand(-1, -1, 2))
+
+
+def offroad_excess_beyond_logged(
+    trajectories, future_positions, future_mask, drivable_positions, drivable_mask,
+):
+    batch_size, mode_count = trajectories.shape[:2]
+    if drivable_positions.shape[1] == 0:
+        return trajectories.new_zeros(batch_size)
+
+    validity = future_mask.to(trajectories.dtype)
+    valid_step_counts = validity.sum(dim=-1).clamp_min(1.0)
+    with torch.no_grad():
+        logged_dots = gather_drivable_dots(
+            drivable_positions,
+            nearest_drivable_dot_index(future_positions, drivable_positions, drivable_mask),
+        )
+        logged_distances = (future_positions - logged_dots).norm(dim=-1)
+
+    mode_mean_excess = []
+    for mode_index in range(mode_count):
+        mode_positions = trajectories[:, mode_index]
+        with torch.no_grad():
+            dot_indices = nearest_drivable_dot_index(
+                mode_positions, drivable_positions, drivable_mask
+            )
+        nearest_dots = gather_drivable_dots(drivable_positions, dot_indices)
+        excess = (
+            (mode_positions - nearest_dots).norm(dim=-1) - logged_distances
+        ).relu()
+        mode_mean_excess.append((excess * validity).sum(dim=-1) / valid_step_counts)
+
+    sample_has_drivable_dot = drivable_mask.any(dim=-1).to(trajectories.dtype)
+    return torch.stack(mode_mean_excess, dim=1).mean(dim=1) * sample_has_drivable_dot
+
+
 def prediction_loss(
     trajectories, heading_cosine_sine, confidence_logits,
-    future_positions, future_headings, future_mask, heading_loss_weight,
+    future_positions, future_headings, future_mask,
+    drivable_positions, drivable_mask, heading_loss_weight, offroad_loss_weight,
 ):
     step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
     unit_heading_cosine_sine = heading_cosine_sine / heading_cosine_sine.norm(
@@ -57,9 +101,15 @@ def prediction_loss(
     classification = (
         torch.nn.functional.cross_entropy(confidence_logits, best_mode, reduction="none") * scoreable
     ).sum() / scoreable_count
+    offroad = (
+        offroad_excess_beyond_logged(
+            trajectories, future_positions, future_mask, drivable_positions, drivable_mask
+        ) * scoreable
+    ).sum() / scoreable_count
     total = (
         regression
         + MODE_CLASSIFICATION_WEIGHT * classification
         + heading_loss_weight * heading
+        + offroad_loss_weight * offroad
     )
-    return total, regression, classification, heading
+    return total, regression, classification, heading, offroad

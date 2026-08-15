@@ -1,11 +1,10 @@
 # > Training entry point: recipe v1 - plain AdamW, constant rate, no schedule, no clipping
-# The epoch loop computes the loss components and the minADE/minFDE monitor ONLY (§36:
-# kinematics and off-road are finish-line diagnostics, never inside the epoch). Weight decay
+# The epoch loop computes the loss components and the minADE/minFDE monitor ONLY. Weight decay
 # skips biases, LayerNorms and the 64 learned queries - parameters whose job is to become
 # non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied forward).
 # LEARNING_RATE 1e-3 and WEIGHT_DECAY 0.01 are Scott's provisional values, 2026-08-13,
-# falsifiable from the first training curve. --heading-loss-weight carries no default: the
-# auxiliary heading term's weight is set per run and never inherited from the code.
+# falsifiable from the first training curve. --heading-loss-weight and --offroad-loss-weight carry
+# no default: an auxiliary term's weight is set per run and never inherited from the code.
 # ade_80step / fde_80step are NOT the leaderboard's minADE / minFDE and are named so nobody can
 # read them as such: they average over all 80 valid future steps at 10 Hz, while a WOMD submission
 # is 16 steps at 2 Hz scored by Waymo's own referee, which lives in the container and does not
@@ -48,10 +47,24 @@ def parameter_groups(predictor):
     ]
 
 
-def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight):
+def save_checkpoint(checkpoint_path, previous_checkpoint_path, checkpoint_state):
+    partial_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".partial")
+    torch.save(checkpoint_state, partial_path)
+    if checkpoint_path.exists():
+        checkpoint_path.replace(previous_checkpoint_path)
+    partial_path.replace(checkpoint_path)
+
+
+def train_epoch(
+    predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
+    offroad_loss_weight, checkpoint_path, previous_checkpoint_path, checkpoint_every_seconds,
+    epoch_index, seed,
+):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
-    loss_sums = {"total": 0.0, "regression": 0.0, "classification": 0.0, "heading": 0.0}
+    loss_sums = {
+        "total": 0.0, "regression": 0.0, "classification": 0.0, "heading": 0.0, "offroad": 0.0,
+    }
     window_loss_sums = dict.fromkeys(loss_sums, 0.0)
     seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
     batch_count = 0
@@ -61,6 +74,7 @@ def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_
     non_finite_total_count = 0
     gradient_scaler_skip_count = 0
     wait_start = time.perf_counter()
+    checkpoint_wait_start = time.perf_counter()
     for batch in batches:
         seconds["data_wait"] += time.perf_counter() - wait_start
 
@@ -68,10 +82,11 @@ def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_
         batch = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
             trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
-            total, regression, classification, heading = loss.prediction_loss(
+            total, regression, classification, heading, offroad = loss.prediction_loss(
                 trajectories, heading_cosine_sine, confidence_logits,
                 batch["future_positions"], batch["future_headings"], batch["future_mask"],
-                heading_loss_weight,
+                batch["drivable_positions"], batch["drivable_mask"],
+                heading_loss_weight, offroad_loss_weight,
             )
         optimizer.zero_grad()
         gradient_scaler.scale(total).backward()
@@ -84,6 +99,7 @@ def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_
             "regression": float(regression.detach()),
             "classification": float(classification.detach()),
             "heading": float(heading.detach()),
+            "offroad": float(offroad.detach()),
         }
         for name, value in component_values.items():
             loss_sums[name] += value
@@ -130,6 +146,7 @@ def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_
                 f"kept modes {window_monitor['mean_kept_modes']:.2f} "
                 f"backfilled {100 * window_monitor['backfill_rate']:.0f}% | "
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / window_loss_sums['regression']:.4f} "
+                f"off/reg {offroad_loss_weight * window_loss_sums['offroad'] / window_loss_sums['regression']:.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
                 f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
@@ -144,6 +161,25 @@ def train_epoch(predictor, optimizer, batches, device, gradient_scaler, heading_
             window_accumulator = metrics.MetricAccumulator()
             window_loss_sums = dict.fromkeys(loss_sums, 0.0)
             window_peak_tokens = 0
+        if time.perf_counter() - checkpoint_wait_start >= checkpoint_every_seconds:
+            if math.isfinite(component_values["total"]):
+                save_checkpoint(
+                    checkpoint_path, previous_checkpoint_path,
+                    {
+                        "model_state": predictor.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "epoch_index": epoch_index,
+                        "batch_index": batch_count,
+                        "seed": seed,
+                    },
+                )
+            else:
+                print(
+                    f"batch {batch_count} total loss {component_values['total']},"
+                    f" checkpoint {checkpoint_path} left as it was",
+                    flush=True,
+                )
+            checkpoint_wait_start = time.perf_counter()
         wait_start = time.perf_counter()
     averages = {name: value / max(batch_count, 1) for name, value in loss_sums.items()}
     return averages, accumulator.results(), seconds
@@ -157,6 +193,9 @@ def main():
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--heading-loss-weight", type=float, required=True)
+    parser.add_argument("--offroad-loss-weight", type=float, required=True)
+    parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
@@ -174,20 +213,30 @@ def main():
         arguments.checkpoint_path.suffix + ".previous"
     )
 
-    for epoch_index in range(arguments.epochs):
+    start_epoch_index = 0
+    if arguments.resume and arguments.checkpoint_path.exists():
+        checkpoint = torch.load(arguments.checkpoint_path, map_location=device)
+        predictor.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch_index = checkpoint["epoch_index"] + 1
+
+    for epoch_index in range(start_epoch_index, arguments.epochs):
         batches = pipeline.batches(
             scenario_paths, arguments.workers, arguments.batch_size,
             arguments.prefetch, arguments.seed + epoch_index,
             not arguments.all_eligible_agents,
         )
         averages, monitor, seconds = train_epoch(
-            predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight
+            predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
+            arguments.offroad_loss_weight, arguments.checkpoint_path, previous_checkpoint_path,
+            arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
         )
         print(
             f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
             f" + cls {averages['classification']:.4f}"
-            f" + hdg {averages['heading']:.4f}) | "
+            f" + hdg {averages['heading']:.4f}"
+            f" + off {averages['offroad']:.4f}) | "
             f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
             f"kept modes {monitor['mean_kept_modes']:.2f}"
             f" | backfilled {100 * monitor['backfill_rate']:.0f}% | "
@@ -202,19 +251,16 @@ def main():
                 flush=True,
             )
             continue
-        partial_path = arguments.checkpoint_path.with_suffix(arguments.checkpoint_path.suffix + ".partial")
-        torch.save(
+        save_checkpoint(
+            arguments.checkpoint_path, previous_checkpoint_path,
             {
                 "model_state": predictor.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "epoch_index": epoch_index,
+                "batch_index": None,
                 "seed": arguments.seed,
             },
-            partial_path,
         )
-        if arguments.checkpoint_path.exists():
-            arguments.checkpoint_path.replace(previous_checkpoint_path)
-        partial_path.replace(arguments.checkpoint_path)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,8 @@ DEVICE_COMPONENTS = (
     "host to device copy", "forward", "loss", "backward", "optimizer step", "monitor update"
 )
 BUILD_SAMPLE_STAGES = (
-    "sample_frame", "agent track reframe", "neighbour history reframe", "crop_and_reframe_map"
+    "sample_frame", "agent track reframe", "neighbour history reframe",
+    "lane_context_per_polyline", "crop_and_reframe_map"
 )
 
 
@@ -161,14 +162,22 @@ def time_build_sample_stages(timer, scenario_arrays, track_index):
     )
     timer.stop("neighbour history reframe")
 
-    speed = float(
-        np.linalg.norm(track_rows[track_index, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY])
+    now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
+    speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
+    timer.start("lane_context_per_polyline")
+    polyline_lane_context = loader.lane_context_per_polyline(
+        scenario_arrays,
+        now_row[contract.AGENT_POSITION],
+        now_row[contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
     )
+    timer.stop("lane_context_per_polyline")
+
     timer.start("crop_and_reframe_map")
     loader.crop_and_reframe_map(
         scenario_arrays["map_rows"],
         scenario_arrays["map_dot_polyline_index"],
         scenario_arrays["polyline_signal_histories"],
+        polyline_lane_context,
         origin,
         heading,
         speed,
@@ -189,9 +198,10 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
         timer.stop("forward")
 
         timer.start("loss")
-        total, _, _, _ = loss.prediction_loss(
+        total, _, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, confidence_logits,
-            batch["future_positions"], batch["future_headings"], batch["future_mask"], 1.0
+            batch["future_positions"], batch["future_headings"], batch["future_mask"],
+            batch["drivable_positions"], batch["drivable_mask"], 1.0, 1.0
         )
         timer.stop("loss")
 

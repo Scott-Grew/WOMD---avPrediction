@@ -18,7 +18,7 @@ STAGING_CROP_RADIUS_METRES = 400.0              # Scott 2026-08-14. measure_stag
 MAP_POINT_SPACING_METRES = 1.0                  # Scott 2026-08-14, was 0.5. Halves staged bytes, per-sample cost and read bandwidth. Geometry cost, measure_staging.py over 3,564,503 dropped dots: p50 0.0000 m, p99 0.138 m, max 0.495 m. Model cost measured directly on the polyline tokens the attention actually reads, 4,054 tokens over 25 scenarios: cosine similarity p50 1.00000 / p5 0.99965, relative change p50 0.0005 / p95 0.0266; uncorrelated with polyline length (r = 0.007); lanes 0.0003, road lines 0.0001, stop signs 0.0000, and the change concentrates on polygon kinds (speed bump 0.031, driveway 0.016, crosswalk 0.015) whose corners are what alternate-dot dropping costs.
 MAP_CHUNK_DOTS = 20                             # Scott 2026-08-14: a map token is at most 20 consecutive dots of one polyline, not one token per whole polyline. Measured over four DISJOINT 40-scenario blocks of ../data/staged (400 m, 1.0 m spacing, ALL designated targets): tokens/sample 189->450, 209->488, 215->520, 234->528, i.e. a stable 2.25-2.41x, and every token capped at 20 dots = 20 m against p90 75 m unchunked. Attention measured 6.1% of total epoch time on a Kaggle T4 (profile_step.py) so the token growth is affordable. An earlier 178->426 pair recorded here came from sampling only the FIRST target per scenario and does not reproduce; it is superseded by the four blocks above.
 NUM_PREDICTED_MODES = 6                         # Mode = possible future. We predict X futures. WOMD caps submissions at 6. Prune from X.
-STAGING_CODE_VERSION = "2026-08-15-b"           # Bumped by hand on every code-dataset upload. kaggle_preflight compares working copy vs mount.
+STAGING_CODE_VERSION = "2026-08-15-c"           # Bumped by hand on every code-dataset upload. kaggle_preflight compares working copy vs mount.
 
 # > SUBMISSION FORMAT. DICTATED BY waymo_open_dataset/protos/motion_submission.proto, READ 2026-08-14.
 SUBMISSION_STEPS = 16                           # motion_submission.proto, read 2026-08-14: "these fields must be exactly length 16 - 8 seconds with 2 steps per second".
@@ -125,7 +125,10 @@ NUM_BOUNDARY_TYPES = len(BOUNDARY_TYPES)
 
 MAP_BOUNDARY_TYPE = slice(MAP_SPEED_LIMIT + 1, MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES)
 MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
-MAP_FEATURE_DIM = MAP_STOP_POINT.stop
+MAP_LEFT_BOUNDARY_CROSSING = MAP_STOP_POINT.stop
+MAP_RIGHT_BOUNDARY_CROSSING = MAP_LEFT_BOUNDARY_CROSSING + 1
+MAP_FEATURE_DIM = MAP_RIGHT_BOUNDARY_CROSSING + 1
+NUM_BOUNDARY_CROSSING_CODES = NUM_BOUNDARY_TYPES + 1
 
 # > LANE GRAPH. MIRRORS proto/waymo_open_dataset/protos/map.proto, READ 2026-08-14.
 # Every relation below is a flat table of WOMD MapFeature ids plus storage-frame geometry. It holds
@@ -168,3 +171,11 @@ LANE_BOUNDARY_BOUND_WIDTH = LANE_BOUNDARY_END.stop
 STOP_SIGN_FEATURE = 0                           # map.proto MapFeature.id = 1 of the stop sign.
 STOP_SIGN_CONTROLLED_LANE = 1                   # map.proto StopSign.lane = 1, one row per controlled lane.
 STOP_SIGN_LANE_WIDTH = STOP_SIGN_CONTROLLED_LANE + 1
+
+LANE_CONTEXT_REACHABLE = 0
+LANE_CONTEXT_GRAPH_DISTANCE = 1
+LANE_CONTEXT_AGENT_LANE_DISTANCE = 2            # Scott 2026-08-15, replacing a LANE_FOUND flag that shipped CONSTANT: an argmin over lane dots with no threshold (the only form the no-invented-benchmark rule allows) always finds a lane, and 0 of 287 staged scenarios have none, so the flag never fired. The metres from the agent to its nearest lane centre dot say the same thing continuously with nothing to choose - measured over 1,278 designated targets, p50 0.47 m, p95 4.70 m, max 27.76 m, 4.5% beyond 5 m.
+LANE_CONTEXT_HAS_EXIT_NOT_PRESENT = 3
+LANE_CONTEXT_HAS_ENTRY_NOT_PRESENT = 4
+LANE_CONTEXT_HAS_STOP_SIGN = 5
+LANE_CONTEXT_DIM = 6

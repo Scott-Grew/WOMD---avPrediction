@@ -104,10 +104,15 @@ def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
         "map_chunk_signal_history": torch.zeros(
             2, 5, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
         ),
+        "map_chunk_lane_context": torch.zeros(2, 5, contract.LANE_CONTEXT_DIM),
         "max_polylines_in_batch": torch.tensor(5),
     }
     batch["neighbour_history_mask"][:, 5] = False
     batch["map_chunk_signal_history"][0, 1:3, :, 6] = 1.0
+    batch["map_chunk_lane_context"][0, 1:3, contract.LANE_CONTEXT_REACHABLE] = 1.0
+    batch["map_rows"][:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
+        0, contract.NUM_BOUNDARY_CROSSING_CODES, (80, 2), dtype=torch.float32
+    )
 
     neighbour_order = torch.randperm(6)
     map_order = torch.randperm(80)
@@ -141,6 +146,75 @@ def test_polyline_pooling_isolates_groups_and_leaves_empty_slots_absent():
     assert torch.equal(poisoned_tokens[0, 1:], tokens[0, 1:])
     assert torch.equal(poisoned_tokens[1], tokens[1])
     assert not torch.equal(poisoned_tokens[0, 0], tokens[0, 0])
+
+
+def lane_polyline_rows(first_dot_x, dot_count):
+    rows = np.zeros((dot_count, contract.MAP_FEATURE_DIM), dtype=np.float32)
+    rows[:, contract.MAP_POSITION] = np.stack(
+        [first_dot_x + np.arange(dot_count, dtype=np.float64), np.zeros(dot_count)], axis=1
+    )
+    rows[:, contract.MAP_DIRECTION] = np.array([1.0, 0.0])
+    rows[:, contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index("lane")] = 1.0
+    return rows
+
+
+def test_lane_context_walks_connections_forward_only_and_charges_the_lane_left_behind():
+    feature_lengths = np.array([11, 11, 11], dtype=np.int64)
+    scenario_array = {
+        "map_rows": np.concatenate(
+            [lane_polyline_rows(0.0, 11), lane_polyline_rows(20.0, 11), lane_polyline_rows(-30.0, 11)]
+        ),
+        "feature_lengths": feature_lengths,
+        "feature_ids": np.array([101, 102, 103], dtype=np.int64),
+        "map_dot_polyline_index": np.repeat(np.arange(3), feature_lengths),
+        "lane_connections": np.array([[101, 102, 1], [103, 101, 1]], dtype=np.int64),
+        "stop_sign_controlled_lanes": np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
+    }
+
+    lane_context = loader.lane_context_per_polyline(
+        scenario_array, np.array([5.0, 2.0]), np.array([1.0, 0.0])
+    )
+    own_lane, one_hop_downstream, upstream_only = lane_context
+
+    assert np.all(
+        lane_context[:, contract.LANE_CONTEXT_AGENT_LANE_DISTANCE]
+        == pytest.approx(2.0 / contract.DISTANCE_NORMALISER_METRES, rel=1e-6)
+    )
+    assert own_lane[contract.LANE_CONTEXT_REACHABLE] == 1.0
+    assert own_lane[contract.LANE_CONTEXT_GRAPH_DISTANCE] == 0.0
+    assert one_hop_downstream[contract.LANE_CONTEXT_REACHABLE] == 1.0
+    assert one_hop_downstream[contract.LANE_CONTEXT_GRAPH_DISTANCE] == pytest.approx(
+        10.0 / contract.DISTANCE_NORMALISER_METRES, rel=1e-6
+    )
+    assert upstream_only[contract.LANE_CONTEXT_REACHABLE] == 0.0
+    assert upstream_only[contract.LANE_CONTEXT_GRAPH_DISTANCE] == 0.0
+
+
+def test_padded_chunk_slot_stays_exactly_zero_through_both_map_projections():
+    torch.manual_seed(19)
+    encoder = model.SceneEncoder()
+    map_rows = torch.randn(24, contract.MAP_FEATURE_DIM)
+    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
+        0, contract.NUM_BOUNDARY_CROSSING_CODES, (24, 2), dtype=torch.float32
+    )
+    signal_history = torch.zeros(2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
+    lane_context = torch.zeros(2, 2, contract.LANE_CONTEXT_DIM)
+    signal_history[0, 0, :, 6] = 1.0
+    lane_context[0, 0, contract.LANE_CONTEXT_REACHABLE] = 1.0
+
+    with torch.no_grad():
+        map_tokens, map_present = model.pool_dots_to_polyline_tokens(
+            encoder.map_encoder(map_rows), torch.arange(24) // 12, 2, 2
+        )
+        map_tokens = (
+            map_tokens
+            + encoder.signal_projection(signal_history.flatten(start_dim=-2))
+            + encoder.lane_context_projection(lane_context)
+        )
+
+    assert map_present.tolist() == [[True, True], [False, False]]
+    assert torch.all(map_tokens[1] == 0.0)
+    assert torch.any(map_tokens[0] != 0.0)
 
 
 def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
@@ -226,8 +300,10 @@ def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
         "map_chunk_signal_history": torch.zeros(
             2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
         ),
+        "map_chunk_lane_context": torch.zeros(2, 2, contract.LANE_CONTEXT_DIM),
         "max_polylines_in_batch": torch.tensor(2),
     }
+    batch["map_rows"][:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = 0.0
 
     reachable = (
         current_speeds * contract.FUTURE_HORIZON_SECONDS
@@ -235,11 +311,65 @@ def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
     )
     with torch.no_grad():
         trajectories, _ = predictor(batch)
+    steps = torch.cat([trajectories[..., :1, :], trajectories.diff(dim=-2)], dim=-2)
+    path_lengths = steps.norm(dim=-1).sum(dim=-1)
     distances = trajectories.norm(dim=-1)
 
     float32_rounding_headroom = 1.0 + 8 * torch.finfo(distances.dtype).eps
+    assert (path_lengths <= reachable[:, None] * float32_rounding_headroom).all()
+    assert (path_lengths.amax(dim=1) > 0.99 * reachable).all()
     assert (distances <= reachable[:, None, None] * float32_rounding_headroom).all()
-    assert (distances.amax(dim=(1, 2)) > 0.99 * reachable).all()
+
+
+def regression_and_offroad_terms(trajectories, future_positions, drivable_positions):
+    mode_count, step_count = trajectories.shape[1:3]
+    heading_cosine_sine = torch.zeros(1, mode_count, step_count, 2)
+    heading_cosine_sine[..., 0] = 1.0
+    future_headings = torch.zeros(1, step_count, 2)
+    future_headings[..., 0] = 1.0
+    _, regression, _, _, offroad = loss.prediction_loss(
+        trajectories, heading_cosine_sine, torch.zeros(1, mode_count),
+        future_positions, future_headings, torch.ones(1, step_count, dtype=torch.bool),
+        drivable_positions, torch.ones(drivable_positions.shape[:2], dtype=torch.bool), 0.0, 0.0,
+    )
+    return float(regression), float(offroad)
+
+
+def test_offroad_term_charges_only_what_the_prediction_adds_over_the_logged_future():
+    drivable_positions = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
+    logged_on_a_drivable_dot = torch.tensor([[[0.0, 0.0]]])
+    predicted_on_drivable_dots = torch.tensor([[[[0.0, 0.0]], [[10.0, 0.0]]]])
+    predicted_four_metres_off = torch.tensor([[[[0.0, 4.0]], [[10.0, 4.0]]]])
+    logged_one_metre_off = torch.tensor([[[0.0, 1.0]]])
+
+    _, on_road_offroad = regression_and_offroad_terms(
+        predicted_on_drivable_dots, logged_on_a_drivable_dot, drivable_positions
+    )
+    _, offroad_against_logged_dot = regression_and_offroad_terms(
+        predicted_four_metres_off, logged_on_a_drivable_dot, drivable_positions
+    )
+    _, offroad_against_offset_logged = regression_and_offroad_terms(
+        predicted_four_metres_off, logged_one_metre_off, drivable_positions
+    )
+
+    assert on_road_offroad == 0.0
+    assert offroad_against_logged_dot == pytest.approx(4.0)
+    assert offroad_against_offset_logged == pytest.approx(3.0)
+
+
+def test_offroad_term_reaches_a_losing_mode_the_winning_mode_never_touches():
+    drivable_positions = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
+    logged_future = torch.tensor([[[0.0, 0.0], [10.0, 0.0]]])
+    trajectories = torch.stack(
+        [logged_future, logged_future + torch.tensor([0.0, 6.0])], dim=1
+    )
+
+    regression, offroad = regression_and_offroad_terms(
+        trajectories, logged_future, drivable_positions
+    )
+
+    assert regression == 0.0
+    assert offroad == pytest.approx(3.0)
 
 
 def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
@@ -255,7 +385,8 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, confidence_logits,
-        batch["future_positions"], batch["future_headings"], batch["future_mask"], 1.0,
+        batch["future_positions"], batch["future_headings"], batch["future_mask"],
+        batch["drivable_positions"], batch["drivable_mask"], 1.0, 1.0,
     )
     assert torch.stack(components).isfinite().all()
     components[0].backward()
