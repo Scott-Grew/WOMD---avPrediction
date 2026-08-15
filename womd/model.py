@@ -229,10 +229,20 @@ def agent_reachable_distance(agent_history):
 # tanh(length) / length approaches 1 as the length goes to zero, so a short path sits in the linear
 # part of the map and costs no resolution, and flooring the divisor at the dtype's own eps keeps
 # the exactly zero path finite.
+# The squash reads the MEAN step, not the summed path, and the first form shipped without that
+# division was measured broken: the head emits one pair per step, so a path is contract.FUTURE_STEPS
+# terms of the size the endpoint form squashed one of, and tanh saturates. Measured on an untrained
+# model over ../data/staged, 2026-08-15: the endpoint form put 0.064 into tanh, the summed path put
+# 13.3, and tanh(13.3) is 1.000000 to every digit. A saturated squash is not a fence - it is an
+# instruction to spend the entire budget, and the 100-epoch run it shipped in did exactly that,
+# predicting 114 m of driving for a stopped car whose logged future walks 10 m, at a path/budget
+# ratio of 1.000 at every percentile. Dividing by the step count is not a chosen constant; it is the
+# count the sum ran over, and it returns tanh's input to the scale the endpoint form worked at.
 def fence_to_reachable_path_length(raw_position, reachable_distance_metres):
     steps = torch.cat([raw_position[..., :1, :], raw_position.diff(dim=-2)], dim=-2)
     path_length = steps.norm(dim=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
-    fenced_length = torch.tanh(path_length) * reachable_distance_metres.view(-1, 1, 1, 1)
+    mean_step_length = path_length / contract.FUTURE_STEPS
+    fenced_length = torch.tanh(mean_step_length) * reachable_distance_metres.view(-1, 1, 1, 1)
     return raw_position * fenced_length / path_length.clamp_min(torch.finfo(raw_position.dtype).eps)
 
 
