@@ -21,12 +21,17 @@ def inside_crop(agent_frame_points, base_radius, forward_stretch):
     return np.where(x > 0.0, forward, rear)
 
 # Which tracks become samples: the three predicted object types, valid at the "now" step.
-# An agent invalid at now has no defined frame to predict from.
-def eligible_track_indices(track_rows, track_valid):
+# An agent invalid at now has no defined frame to predict from. With designated_targets_only
+# the set narrows further to the agents WOMD itself asks for - training's population since
+# Scott's 2026-08-14 ruling; the whole eligible set stays reachable for comparison.
+def eligible_track_indices(track_rows, track_valid, is_designated_target, designated_targets_only):
     now_valid = track_valid[:, contract.CURRENT_STEP_INDEX]
-    predicted_type = track_rows[:, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE][:, 
+    predicted_type = track_rows[:, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE][:,
                                             :contract.NUM_OBJECT_TYPES].sum(axis=1) > 0
-    return np.flatnonzero(now_valid & predicted_type)
+    selected = now_valid & predicted_type
+    if designated_targets_only:
+        selected = selected & is_designated_target
+    return np.flatnonzero(selected)
 
 # The sample's frame: where the predicted agent sits and faces at "now", read off its stored
 # row. arctan2(sin, cos) recovers the angle from the stored pair - the recovery V6 guards.

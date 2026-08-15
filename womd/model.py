@@ -8,6 +8,27 @@ from womd import contract
 
 HIDDEN_DIM = 128
 
+
+# One divisor per feature column, applied before each encoder's first Linear. Every distance-like
+# column shares contract.DISTANCE_NORMALISER_METRES so geometry survives; a column with no
+# measured scale - heading cosine/sine, direction arrows, one-hots, the SDC flag, the signal-state
+# block - keeps a divisor of 1 and passes through untouched.
+def agent_feature_divisors():
+    divisors = torch.ones(contract.AGENT_FEATURE_DIM)
+    divisors[contract.AGENT_POSITION] = contract.DISTANCE_NORMALISER_METRES
+    divisors[contract.AGENT_VELOCITY] = contract.VELOCITY_NORMALISER_METRES_PER_SECOND
+    divisors[contract.AGENT_DIMENSIONS] = contract.DIMENSION_NORMALISER_METRES
+    return divisors
+
+
+def map_feature_divisors():
+    divisors = torch.ones(contract.MAP_FEATURE_DIM)
+    divisors[contract.MAP_POSITION] = contract.DISTANCE_NORMALISER_METRES
+    divisors[contract.MAP_SPEED_LIMIT] = contract.SPEED_LIMIT_NORMALISER_METRES_PER_SECOND
+    divisors[contract.MAP_STOP_POINT] = contract.DISTANCE_NORMALISER_METRES
+    return divisors
+
+
 # Flatten the 11 history rows into one ordered vector (position-in-vector IS time, §28 flatten
 # ruling) plus the 11 validity flags, then MLP down to one embedding. Invalid rows are zeroed
 # FIRST: the loader's re-framing turns stored zero-rows into non-zero garbage positions, so the
@@ -16,6 +37,7 @@ class AgentHistoryEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         input_width = contract.HISTORY_STEPS * (contract.AGENT_FEATURE_DIM + 1)
+        self.register_buffer("feature_divisors", agent_feature_divisors())
         self.network = nn.Sequential(
             nn.Linear(input_width, HIDDEN_DIM),
             nn.ReLU(),
@@ -24,7 +46,7 @@ class AgentHistoryEncoder(nn.Module):
 
     def forward(self, agent_history, agent_history_mask):
         validity = agent_history_mask.unsqueeze(-1).to(agent_history.dtype)
-        masked_history = agent_history * validity
+        masked_history = agent_history / self.feature_divisors * validity
         flattened = torch.cat([masked_history, validity], dim=-1).flatten(start_dim=-2)
         return self.network(flattened)
 
@@ -34,6 +56,7 @@ class AgentHistoryEncoder(nn.Module):
 class MapDotEncoder(nn.Module):
     def __init__(self):
         super().__init__()
+        self.register_buffer("feature_divisors", map_feature_divisors())
         self.network = nn.Sequential(
             nn.Linear(contract.MAP_FEATURE_DIM, HIDDEN_DIM),
             nn.ReLU(),
@@ -41,7 +64,7 @@ class MapDotEncoder(nn.Module):
         )
 
     def forward(self, map_rows):
-        return self.network(map_rows)
+        return self.network(map_rows / self.feature_divisors)
 
 
 # One token per POLYLINE, not per dot (§34 token-count recomputation, 2026-08-14: measured
@@ -153,7 +176,8 @@ PRUNE_DISTANCE_METRES = 2.5
 
 # 64 learned queries, each a standing question the model owns. Each cross-attends over the
 # scene tokens and a SHARED head writes its trajectory + confidence - modes differ only by
-# their query vector, so query count is a config number.
+# their query vector, so query count is a config number. The head writes in the same normalised
+# units the encoders read; trajectories leave this module in metres.
 class ModeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -171,9 +195,11 @@ class ModeDecoder(nn.Module):
         batch_size = tokens.shape[0]
         queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
-        trajectories = self.trajectory_head(read).view(batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2)
+        normalised_trajectories = self.trajectory_head(read).view(
+            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2
+        )
         confidence_logits = self.confidence_head(read).squeeze(-1)
-        return trajectories, confidence_logits
+        return normalised_trajectories * contract.DISTANCE_NORMALISER_METRES, confidence_logits
 
 
 # Confidence-ordered endpoint pruning (MTR's reduction): walk modes by descending confidence,

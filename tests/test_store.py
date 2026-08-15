@@ -91,7 +91,7 @@ def test_fill_bridges_measured_worst_case_shapes():
     edge_points, edge_arrows, _ = store.map_feature_to_storage_frame(
         endpoint_pair_edge, WORLD_ORIGIN, WORLD_HEADING
     )
-    assert len(edge_points) == 321
+    assert len(edge_points) == int(np.ceil(159.8 / contract.MAP_POINT_SPACING_METRES)) + 1
     edge_gaps = np.linalg.norm(np.diff(edge_points, axis=0), axis=1)
     assert np.all(edge_gaps <= contract.MAP_POINT_SPACING_METRES + 1e-9)
     assert np.allclose(np.linalg.norm(edge_arrows, axis=1), 1.0)
@@ -112,7 +112,7 @@ def test_crop_keeps_polyline_crossing_the_boundary():
     stored_points, stored_arrows, _ = store.map_feature_to_storage_frame(
         crossing_edge, WORLD_ORIGIN, WORLD_HEADING
     )
-    assert len(stored_points) > 900
+    assert len(stored_points) > 600.0 / contract.MAP_POINT_SPACING_METRES * 0.9
     assert len(stored_points) == len(stored_arrows)
     assert np.all(
         np.linalg.norm(stored_points, axis=1) <= contract.STAGING_CROP_RADIUS_METRES

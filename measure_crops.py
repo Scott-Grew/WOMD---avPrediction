@@ -31,7 +31,9 @@ def main():
         map_points = scenario_file["map_rows"][:, contract.MAP_POSITION]
         neighbour_counts.append(len(track_rows))
 
-        for track_index in eligible_track_indices(track_rows, track_valid):
+        for track_index in eligible_track_indices(
+            track_rows, track_valid, scenario_file["is_designated_target"], False
+        ):
             now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
             speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
             band = next(b for b in SPEED_BANDS if b[0] <= speed < b[1])

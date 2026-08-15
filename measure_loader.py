@@ -7,7 +7,7 @@ import numpy as np
 from womd import contract, loader, pipeline
 
 
-def timed_epoch(staged_directory):
+def timed_epoch(staged_directory, designated_targets_only):
     scenario_paths = sorted(Path(staged_directory).glob("*.npz"))
     read_seconds = 0.0
     build_seconds = 0.0
@@ -21,11 +21,17 @@ def timed_epoch(staged_directory):
         scenario_arrays = loader.read_scenario(scenario_path)
         read_seconds += time.perf_counter() - start
 
-        eligible = loader.eligible_track_indices(
-            scenario_arrays["track_rows"], scenario_arrays["track_valid"]
+        sample_track_indices = loader.eligible_track_indices(
+            scenario_arrays["track_rows"],
+            scenario_arrays["track_valid"],
+            scenario_arrays["is_designated_target"],
+            designated_targets_only,
         )
         start = time.perf_counter()
-        samples = [loader.build_sample(scenario_arrays, int(track_index)) for track_index in eligible]
+        samples = [
+            loader.build_sample(scenario_arrays, int(track_index))
+            for track_index in sample_track_indices
+        ]
         build_seconds += time.perf_counter() - start
 
         start = time.perf_counter()
@@ -73,12 +79,14 @@ def padding_waste_curve(sample_dot_counts, batch_sizes):
         )
 
 
-def timed_pipeline_epoch(staged_directory, worker_count, batch_size, prefetch_batches):
+def timed_pipeline_epoch(staged_directory, worker_count, batch_size, prefetch_batches, designated_targets_only):
     scenario_paths = sorted(Path(staged_directory).glob("*.npz"))
     batch_count = 0
     sample_count = 0
     start = time.perf_counter()
-    stream = pipeline.batches(scenario_paths, worker_count, batch_size, prefetch_batches, 0)
+    stream = pipeline.batches(
+        scenario_paths, worker_count, batch_size, prefetch_batches, 0, designated_targets_only
+    )
     for batch in stream:
         batch_count += 1
         sample_count += batch["agent_history"].shape[0]
@@ -90,8 +98,15 @@ def timed_pipeline_epoch(staged_directory, worker_count, batch_size, prefetch_ba
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5:
-        timed_pipeline_epoch(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
+    designated_targets_only = "--all-eligible-agents" not in sys.argv
+    positional_arguments = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
+    if len(positional_arguments) == 4:
+        timed_pipeline_epoch(
+            positional_arguments[0], int(positional_arguments[1]), int(positional_arguments[2]),
+            int(positional_arguments[3]), designated_targets_only,
+        )
     else:
-        dot_counts, epoch_seconds, sample_count = timed_epoch(sys.argv[1])
+        dot_counts, epoch_seconds, sample_count = timed_epoch(
+            positional_arguments[0], designated_targets_only
+        )
         padding_waste_curve(dot_counts, (8, 16, 32, 64, 128, 256))
