@@ -5,10 +5,21 @@
 # much of each agent's own reachable budget the predictions spend.
 # The random draw is the control the confidence number is read against: a confidence head that
 # cannot beat it has learned nothing about which mode to trust, whatever the loss curve says.
-# The anchor null is the control the MODEL is read against, on the same samples in the same table:
-# the six most-used fitted anchors driven to in a straight line with the scene unread. A model that
-# cannot beat it has learned nothing the anchors did not already carry.
-# Every distance is masked to the steps the logged track actually recorded.
+# Four nulls are the controls the MODEL is read against, on the same samples through the same path.
+# Constant velocity carries the logged velocity for the whole horizon and CTRV carries the logged
+# yaw rate with it: a model that cannot beat those has learned nothing about the agent's own motion.
+# The anchor null drives the six most-used fitted anchors in a straight line with the scene unread: a
+# model that cannot beat it has learned nothing the anchors did not already carry. The lane null
+# drives the lane the agent is already in, at the speed it is already going, out to six routes
+# through the lane graph's forks: a model that cannot beat it has learned nothing from the map,
+# the lane graph, the traffic lights or the neighbours it is handed.
+# Every distance is masked to the steps the logged track actually recorded, and every one is reported
+# TWICE: over all 80 logged future steps, which is what train.py's ade_80step monitor averages, and
+# over the 16 decimated steps a submission actually carries. They are not the same number - the 16
+# steps a submission sends are weighted toward the far end of the horizon, where the error is - so
+# neither is printed without the other beside it.
+# Every designated target in the directory is scored; there is no sample cap, because the per-sample
+# error has a standard deviation over 2 m and a few hundred samples cannot separate two checkpoints.
 # Run: python3 measure_checkpoint.py checkpoint.pt ../data/staged fitted_anchors.npz
 
 import sys
@@ -17,16 +28,62 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import baseline, contract, metrics, model, pipeline
+from womd import baseline, contract, loader, model, pipeline
 
-SAMPLE_LIMIT = 512
 RANDOM_DRAW_SEED = 0
+SCENARIO_ORDER_SEED = 0
+BATCH_SIZE = 16
+SUBMITTED_STEPS = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
+STEP_SETS = ("ade_80step", "ade_16step")
 
 
 def mode_mean_distances(trajectories, future_positions, future_mask):
     step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
     validity = future_mask.unsqueeze(1).to(step_distances.dtype)
     return (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
+
+
+def best_mode_distance(step_set, trajectories, future_positions, future_mask):
+    if step_set == "ade_16step":
+        trajectories = trajectories[..., SUBMITTED_STEPS, :]
+        future_positions = future_positions[:, SUBMITTED_STEPS]
+        future_mask = future_mask[:, SUBMITTED_STEPS]
+    return mode_mean_distances(trajectories, future_positions, future_mask).min(dim=1).values
+
+
+def batches_with_lane_null(staged_directory, batch_size, seed):
+    scenario_paths = sorted(staged_directory.glob("*.npz"))
+    samples, lane_null_trajectories, followed_a_lane = [], [], []
+
+    def collated():
+        return (
+            pipeline.collate_samples(samples),
+            torch.from_numpy(np.stack(lane_null_trajectories)),
+            torch.tensor(followed_a_lane),
+        )
+
+    for scenario_index in np.random.default_rng(seed).permutation(len(scenario_paths)):
+        scenario_array = loader.read_scenario(scenario_paths[scenario_index])
+        for track_index in loader.eligible_track_indices(
+            scenario_array["track_rows"],
+            scenario_array["track_valid"],
+            scenario_array["is_designated_target"],
+            True,
+        ):
+            samples.append(loader.build_sample(scenario_array, int(track_index)))
+            trajectories, lane_found = baseline.follow_the_lane_predictions(
+                scenario_array, int(track_index)
+            )
+            lane_null_trajectories.append(trajectories)
+            followed_a_lane.append(lane_found)
+            if len(samples) < batch_size:
+                continue
+            yield collated()
+            samples.clear()
+            lane_null_trajectories.clear()
+            followed_a_lane.clear()
+    if samples:
+        yield collated()
 
 
 def main():
@@ -40,61 +97,80 @@ def main():
     predictor.eval()
     generator = torch.Generator().manual_seed(RANDOM_DRAW_SEED)
 
-    all_modes, by_confidence, at_random, anchor_null, widest_gap, budget_use = [], [], [], [], [], []
+    best_distances = {}
+    widest_gap, budget_use = [], []
     sample_count = 0
-    for batch in pipeline.batches(sorted(staged_directory.glob("*.npz")), 0, 16, 0, 0, True):
+    lane_fallback_count = 0
+    for batch, lane_null_trajectories, followed_a_lane in batches_with_lane_null(
+        staged_directory, BATCH_SIZE, SCENARIO_ORDER_SEED
+    ):
         with torch.no_grad():
             trajectories, confidence_logits = predictor(batch)
         scoreable = batch["future_mask"].any(dim=-1)
         if not scoreable.any():
             continue
-        distances = mode_mean_distances(
-            trajectories, batch["future_positions"], batch["future_mask"]
-        )[scoreable]
-        pruned, pruned_logits = model.prune_modes_batched(
-            trajectories[scoreable], confidence_logits[scoreable]
-        )
-        pruned_distances = mode_mean_distances(
-            pruned, batch["future_positions"][scoreable], batch["future_mask"][scoreable]
-        )
+        scored_trajectories = trajectories[scoreable]
+        future_positions = batch["future_positions"][scoreable]
+        future_mask = batch["future_mask"][scoreable]
+        pruned, _ = model.prune_modes_batched(scored_trajectories, confidence_logits[scoreable])
         draw = torch.stack([
-            torch.randperm(distances.shape[1], generator=generator)[: contract.NUM_PREDICTED_MODES]
-            for _ in range(distances.shape[0])
+            torch.randperm(scored_trajectories.shape[1], generator=generator)[
+                : contract.NUM_PREDICTED_MODES
+            ]
+            for _ in range(scored_trajectories.shape[0])
         ])
+        anchor_trajectories, _ = baseline.straight_lines_to_most_used_anchors(batch, unit_anchors)
+        constant_velocity_trajectories, _ = baseline.constant_velocity(batch)
+        turn_rate_trajectories, _ = baseline.constant_turn_rate_and_velocity(batch)
 
-        endpoints = trajectories[scoreable][:, :, -1]
-        reachable = model.agent_reachable_distance(batch["agent_history"][scoreable])
-        steps = torch.cat([
-            trajectories[scoreable][..., :1, :], trajectories[scoreable].diff(dim=-2)
-        ], dim=-2)
-
-        null_trajectories, _ = baseline.straight_lines_to_most_used_anchors(batch, unit_anchors)
-        null_distances = mode_mean_distances(
-            null_trajectories[scoreable],
-            batch["future_positions"][scoreable],
-            batch["future_mask"][scoreable],
+        mode_sets = (
+            ("best of ALL modes", scored_trajectories),
+            ("best of 6 by CONFIDENCE", pruned),
+            ("best of 6 at RANDOM", scored_trajectories.gather(
+                1, draw[:, :, None, None].expand(-1, -1, contract.FUTURE_STEPS, 2)
+            )),
+            ("best of 6 ANCHOR NULL", anchor_trajectories[scoreable]),
+            ("best of 6 LANE NULL", lane_null_trajectories[scoreable]),
+            ("1 mode CONSTANT VELOCITY", constant_velocity_trajectories[scoreable]),
+            ("1 mode CONSTANT TURN RATE", turn_rate_trajectories[scoreable]),
         )
+        for name, modes in mode_sets:
+            for step_set in STEP_SETS:
+                best_distances.setdefault((name, step_set), []).append(
+                    best_mode_distance(step_set, modes, future_positions, future_mask)
+                )
 
-        all_modes.append(distances.min(dim=1).values)
-        by_confidence.append(pruned_distances.min(dim=1).values)
-        at_random.append(distances.gather(1, draw).min(dim=1).values)
-        anchor_null.append(null_distances.min(dim=1).values)
+        endpoints = scored_trajectories[:, :, -1]
+        reachable = model.agent_reachable_distance(batch["agent_history"][scoreable])
+        steps = torch.cat(
+            [scored_trajectories[..., :1, :], scored_trajectories.diff(dim=-2)], dim=-2
+        )
         widest_gap.append(torch.cdist(endpoints, endpoints).amax(dim=(1, 2)))
         budget_use.append(steps.norm(dim=-1).sum(dim=-1).amax(dim=1) / reachable)
         sample_count += int(scoreable.sum())
-        if sample_count >= SAMPLE_LIMIT:
-            break
+        lane_fallback_count += int((~followed_a_lane[scoreable]).sum())
 
-    joined = {name: torch.cat(values).numpy() for name, values in (
-        ("best of ALL modes", all_modes), ("best of 6 by CONFIDENCE", by_confidence),
-        ("best of 6 at RANDOM", at_random), ("best of 6 ANCHOR NULL", anchor_null),
-        ("widest gap between modes", widest_gap), ("path / reachable budget", budget_use),
-    )}
-    print(f"{checkpoint_path} on {staged_directory}: {sample_count} designated targets")
-    print(f"{'quantity':28s}{'mean':>10s}{'p50':>10s}{'p90':>10s}{'max':>10s}")
-    for name, values in joined.items():
-        print(f"{name:28s}{values.mean():10.3f}{np.percentile(values, 50):10.3f}"
+    rows = [
+        (name, step_set, torch.cat(values).numpy())
+        for (name, step_set), values in best_distances.items()
+    ]
+    rows.extend(
+        (name, "", torch.cat(values).numpy())
+        for name, values in (
+            ("widest gap between modes", widest_gap), ("path / reachable budget", budget_use),
+        )
+    )
+    print(f"{checkpoint_path} on {staged_directory}, anchors {fitted_anchors_path}")
+    print(f"every designated target in the directory scored: {sample_count} samples")
+    print("ade_80step averages over all 80 logged future steps at 10 Hz, the quantity train.py"
+          " monitors; ade_16step averages over contract.SUBMISSION_FUTURE_INDICES, the 16 steps a"
+          " submission carries")
+    print(f"{'quantity':27s}{'metric':12s}{'mean':>10s}{'p50':>10s}{'p90':>10s}{'max':>10s}")
+    for name, step_set, values in rows:
+        print(f"{name:27s}{step_set:12s}{values.mean():10.3f}{np.percentile(values, 50):10.3f}"
               f"{np.percentile(values, 90):10.3f}{values.max():10.3f}")
+    print(f"lane null had no lane to follow and fell back to constant velocity for"
+          f" {lane_fallback_count} of {sample_count} agents")
 
 
 if __name__ == "__main__":

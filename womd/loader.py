@@ -61,6 +61,42 @@ def track_rows_to_agent_frame(rows, origin, heading):
     reframed[..., contract.AGENT_HEADING_SINE] = heading_sine * rotation_cosine - heading_cosine * rotation_sine
     return reframed
 
+# A two-way street puts an oncoming centreline within reach of the agent's own, and it is often the
+# closer of the two: measured over 517 designated targets, 12.6% of them have a nearest lane dot
+# whose direction arrow OPPOSES their heading, at a median 2.57 m against 5.66 m for the nearest
+# agreeing dot. Assigning those agents to the oncoming lane made the lane-following null score
+# 10.37 m against constant velocity's 9.40, and the same rule feeds the model's reachability. The
+# candidate set is therefore the dots that point the agent's way, and the sign of a dot product is
+# not a chosen number. Falling back to every dot when none agree keeps an agent facing across a road
+# assigned to something rather than to nothing.
+def nearest_lane_dot_facing_the_agent_way(lane_dot_rows, agent_distances, agent_heading_cosine_sine):
+    faces_the_agent_way = lane_dot_rows[:, contract.MAP_DIRECTION] @ agent_heading_cosine_sine > 0.0
+    candidates = np.flatnonzero(faces_the_agent_way)
+    if len(candidates) == 0:
+        candidates = np.arange(len(lane_dot_rows))
+    return int(candidates[np.argmin(agent_distances[candidates])])
+
+def lane_graph_distances(start_lane_id, exits_of_lane, neighbours_of_lane,
+                         arc_length_of_polyline, polyline_row_of_lane_id):
+    graph_distance_metres = {start_lane_id: 0.0}
+    frontier = [(0.0, start_lane_id)]
+    while frontier:
+        distance_metres, lane_id = heapq.heappop(frontier)
+        if distance_metres > graph_distance_metres[lane_id]:
+            continue
+        distance_past_lane = distance_metres + arc_length_of_polyline[polyline_row_of_lane_id[lane_id]]
+        reached = [(destination_id, distance_past_lane)
+                   for destination_id in exits_of_lane.get(lane_id, ())]
+        reached += [(other_lane_id, distance_metres)
+                    for other_lane_id in neighbours_of_lane.get(lane_id, ())]
+        for destination_id, reached_distance in reached:
+            if destination_id not in polyline_row_of_lane_id:
+                continue
+            if reached_distance < graph_distance_metres.get(destination_id, np.inf):
+                graph_distance_metres[destination_id] = reached_distance
+                heapq.heappush(frontier, (reached_distance, destination_id))
+    return graph_distance_metres
+
 def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
     map_rows = scenario_array["map_rows"]
     feature_lengths = scenario_array["feature_lengths"]
@@ -81,9 +117,9 @@ def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
     lane_context[:, contract.LANE_CONTEXT_AGENT_LANE_DISTANCE] = (
         agent_distances.min() / contract.DISTANCE_NORMALISER_METRES
     )
-    nearest = np.flatnonzero(agent_distances == agent_distances.min())
-    heading_agreement = lane_dot_rows[nearest][:, contract.MAP_DIRECTION] @ agent_heading
-    agent_lane_dot = lane_dot_indices[nearest[np.argmax(heading_agreement)]]
+    agent_lane_dot = lane_dot_indices[nearest_lane_dot_facing_the_agent_way(
+        lane_dot_rows, agent_distances, agent_heading
+    )]
     agent_lane_id = int(feature_ids[dot_polyline_index[agent_lane_dot]])
 
     polyline_row_of_lane_id = {int(feature_id): row for row, feature_id in enumerate(feature_ids)}
@@ -99,30 +135,26 @@ def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
     exits_of_lane = {}
     for source_id, destination_id, _ in scenario_array["lane_connections"].tolist():
         exits_of_lane.setdefault(source_id, []).append(destination_id)
-        if source_id in polyline_row_of_lane_id and destination_id not in polyline_row_of_lane_id:
-            lane_context[polyline_row_of_lane_id[source_id],
-                         contract.LANE_CONTEXT_HAS_EXIT_NOT_PRESENT] = 1.0
-        if destination_id in polyline_row_of_lane_id and source_id not in polyline_row_of_lane_id:
-            lane_context[polyline_row_of_lane_id[destination_id],
-                         contract.LANE_CONTEXT_HAS_ENTRY_NOT_PRESENT] = 1.0
 
-    graph_distance_metres = {agent_lane_id: 0.0}
-    frontier = [(0.0, agent_lane_id)]
-    while frontier:
-        distance_metres, lane_id = heapq.heappop(frontier)
-        if distance_metres > graph_distance_metres[lane_id]:
-            continue
-        distance_past_lane = distance_metres + arc_length_of_polyline[polyline_row_of_lane_id[lane_id]]
-        for destination_id in exits_of_lane.get(lane_id, ()):
-            if destination_id not in polyline_row_of_lane_id:
-                continue
-            if distance_past_lane < graph_distance_metres.get(destination_id, np.inf):
-                graph_distance_metres[destination_id] = distance_past_lane
-                heapq.heappush(frontier, (distance_past_lane, destination_id))
+    neighbours_of_lane = {}
+    for lane_id, other_lane_id, _ in scenario_array["lane_neighbour_ids"].tolist():
+        neighbours_of_lane.setdefault(lane_id, []).append(other_lane_id)
 
-    for lane_id, distance_metres in graph_distance_metres.items():
+    forward_distance_metres = lane_graph_distances(
+        agent_lane_id, exits_of_lane, {}, arc_length_of_polyline, polyline_row_of_lane_id
+    )
+    lane_change_distance_metres = lane_graph_distances(
+        agent_lane_id, exits_of_lane, neighbours_of_lane,
+        arc_length_of_polyline, polyline_row_of_lane_id,
+    )
+
+    for lane_id, distance_metres in lane_change_distance_metres.items():
         polyline_row = polyline_row_of_lane_id[lane_id]
-        lane_context[polyline_row, contract.LANE_CONTEXT_REACHABLE] = 1.0
+        reachable_column = (
+            contract.LANE_CONTEXT_REACHABLE if lane_id in forward_distance_metres
+            else contract.LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE
+        )
+        lane_context[polyline_row, reachable_column] = 1.0
         lane_context[polyline_row, contract.LANE_CONTEXT_GRAPH_DISTANCE] = (
             distance_metres / contract.DISTANCE_NORMALISER_METRES
         )
@@ -190,6 +222,11 @@ def build_sample(scenario_array, track_index):
     neighbour_history = track_rows_to_agent_frame(
         track_rows[neighbour_indices, :contract.HISTORY_STEPS], origin, heading
     )
+    neighbour_future_positions = frame_ops.positions_to_agent_frame(
+        track_rows[neighbour_indices, contract.CURRENT_STEP_INDEX + 1:, contract.AGENT_POSITION],
+        origin,
+        heading,
+    )
 
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
@@ -217,6 +254,8 @@ def build_sample(scenario_array, track_index):
         "future_mask": track_valid[track_index, contract.CURRENT_STEP_INDEX + 1:],
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": track_valid[neighbour_indices, :contract.HISTORY_STEPS],
+        "neighbour_future_positions": neighbour_future_positions,
+        "neighbour_future_mask": track_valid[neighbour_indices, contract.CURRENT_STEP_INDEX + 1:],
         "map_rows": agent_map,
         "map_chunk_index": map_chunk_index.astype(np.int64),
         "map_chunk_signal_history": map_chunk_signal_history,
@@ -247,6 +286,10 @@ def build_batch(samples):
         (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
     )
     neighbour_history_mask = np.zeros((batch_size, max_neighbours, contract.HISTORY_STEPS), dtype=bool)
+    neighbour_future_positions = np.zeros(
+        (batch_size, max_neighbours, contract.FUTURE_STEPS, 2), dtype=np.float32
+    )
+    neighbour_future_mask = np.zeros((batch_size, max_neighbours, contract.FUTURE_STEPS), dtype=bool)
     map_chunk_signal_history = np.zeros(
         (batch_size, max_chunks_in_batch, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
         dtype=np.float32,
@@ -259,6 +302,8 @@ def build_batch(samples):
         neighbour_count = sample["neighbour_history"].shape[0]
         neighbour_history[sample_index, :neighbour_count] = sample["neighbour_history"]
         neighbour_history_mask[sample_index, :neighbour_count] = sample["neighbour_history_mask"]
+        neighbour_future_positions[sample_index, :neighbour_count] = sample["neighbour_future_positions"]
+        neighbour_future_mask[sample_index, :neighbour_count] = sample["neighbour_future_mask"]
         chunk_count = sample["map_chunk_signal_history"].shape[0]
         map_chunk_signal_history[sample_index, :chunk_count] = sample["map_chunk_signal_history"]
         map_chunk_lane_context[sample_index, :chunk_count] = sample["map_chunk_lane_context"]
@@ -271,6 +316,8 @@ def build_batch(samples):
         "future_mask": np.stack([sample["future_mask"] for sample in samples]),
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": neighbour_history_mask,
+        "neighbour_future_positions": neighbour_future_positions,
+        "neighbour_future_mask": neighbour_future_mask,
         "map_rows": np.concatenate(
             [sample["map_rows"] for sample in samples], dtype=np.float32
         ),

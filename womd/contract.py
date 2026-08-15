@@ -128,7 +128,7 @@ MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
 MAP_LEFT_BOUNDARY_CROSSING = MAP_STOP_POINT.stop
 MAP_RIGHT_BOUNDARY_CROSSING = MAP_LEFT_BOUNDARY_CROSSING + 1
 MAP_FEATURE_DIM = MAP_RIGHT_BOUNDARY_CROSSING + 1
-NUM_BOUNDARY_CROSSING_CODES = NUM_BOUNDARY_TYPES + 1
+NUM_BOUNDARY_CROSSING_CODES = len(ROAD_LINE_TYPES) + 1
 
 # > LANE GRAPH. MIRRORS proto/waymo_open_dataset/protos/map.proto, READ 2026-08-14.
 # Every relation below is a flat table of WOMD MapFeature ids plus storage-frame geometry. It holds
@@ -175,7 +175,6 @@ STOP_SIGN_LANE_WIDTH = STOP_SIGN_CONTROLLED_LANE + 1
 LANE_CONTEXT_REACHABLE = 0
 LANE_CONTEXT_GRAPH_DISTANCE = 1
 LANE_CONTEXT_AGENT_LANE_DISTANCE = 2            # Scott 2026-08-15, replacing a LANE_FOUND flag that shipped CONSTANT: an argmin over lane dots with no threshold (the only form the no-invented-benchmark rule allows) always finds a lane, and 0 of 287 staged scenarios have none, so the flag never fired. The metres from the agent to its nearest lane centre dot say the same thing continuously with nothing to choose - measured over 1,278 designated targets, p50 0.47 m, p95 4.70 m, max 27.76 m, 4.5% beyond 5 m.
-LANE_CONTEXT_HAS_EXIT_NOT_PRESENT = 3
-LANE_CONTEXT_HAS_ENTRY_NOT_PRESENT = 4
-LANE_CONTEXT_HAS_STOP_SIGN = 5
-LANE_CONTEXT_DIM = 6
+LANE_CONTEXT_HAS_STOP_SIGN = 3
+LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE = 4
+LANE_CONTEXT_DIM = 5

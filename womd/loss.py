@@ -88,3 +88,9 @@ def prediction_loss(
         + heading_loss_weight * heading
     )
     return total, regression, classification, heading
+
+
+def neighbour_future_loss(neighbour_future_positions, logged_positions, neighbour_future_mask):
+    step_distances = (neighbour_future_positions - logged_positions).norm(dim=-1)
+    validity = neighbour_future_mask.to(step_distances.dtype)
+    return (step_distances * validity).sum() / validity.sum().clamp_min(1.0)

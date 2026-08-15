@@ -195,7 +195,8 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
     with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
         timer.start("forward")
         (
-            trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+            trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+            neighbour_future_positions,
         ) = predictor.predict_with_heading(batch)
         timer.stop("forward")
 
@@ -204,6 +205,11 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
             trajectories, heading_cosine_sine, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
             predictor.unit_anchors, reachable_distance_metres, 1.0
+        )
+        total = total + loss.neighbour_future_loss(
+            neighbour_future_positions,
+            batch["neighbour_future_positions"],
+            batch["neighbour_future_mask"],
         )
         timer.stop("loss")
 

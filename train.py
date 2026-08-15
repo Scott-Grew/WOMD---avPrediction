@@ -1,4 +1,4 @@
-# > Training entry point: recipe v1 - plain AdamW, constant rate, no schedule, no clipping
+# > Training entry point: recipe v1 - plain AdamW, cosine rate decay to zero, no warmup, no clipping
 # The epoch loop computes the loss components and the minADE/minFDE monitor ONLY. Weight decay
 # skips biases, LayerNorms, the learned queries and the learned anchors - parameters whose job
 # is to become or stay non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied
@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import loss, metrics, pipeline
+from womd import loader, loss, metrics, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
 LEARNING_RATE = 1e-3
@@ -41,7 +41,7 @@ def parameter_groups(predictor):
     decayed = []
     undecayed = []
     for name, parameter in predictor.named_parameters():
-        if parameter.ndim >= 2 and not name.endswith(("queries", "unit_anchors")):
+        if parameter.ndim >= 2 and not name.endswith(("queries", "anchor_offsets")):
             decayed.append(parameter)
         else:
             undecayed.append(parameter)
@@ -51,9 +51,44 @@ def parameter_groups(predictor):
     ]
 
 
-def save_checkpoint(checkpoint_path, previous_checkpoint_path, checkpoint_state):
+def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designated_targets_only):
+    stream_count = max(worker_count, 1)
+    steps = 0
+    for stream_index in range(stream_count):
+        stream_sample_count = 0
+        for scenario_path in scenario_paths[stream_index::stream_count]:
+            with np.load(scenario_path) as scenario_file:
+                stream_sample_count += len(loader.eligible_track_indices(
+                    scenario_file["track_rows"],
+                    scenario_file["track_valid"],
+                    scenario_file["is_designated_target"],
+                    designated_targets_only,
+                ))
+        steps += math.ceil(stream_sample_count / batch_size)
+    return steps
+
+
+def cosine_learning_rate(completed_steps, total_steps):
+    return LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * completed_steps / total_steps))
+
+
+def checkpoint_state(predictor, optimizer, seed, completed_epochs, batch_index):
+    return {
+        "model_state": predictor.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "completed_epochs": completed_epochs,
+        "batch_index": batch_index,
+        "seed": seed,
+    }
+
+
+def epochs_left_to_train(completed_epochs, requested_epochs):
+    return range(completed_epochs, requested_epochs)
+
+
+def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".partial")
-    torch.save(checkpoint_state, partial_path)
+    torch.save(state, partial_path)
     if checkpoint_path.exists():
         checkpoint_path.replace(previous_checkpoint_path)
     partial_path.replace(checkpoint_path)
@@ -61,12 +96,16 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, checkpoint_state)
 
 def train_epoch(
     predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
-    checkpoint_path, previous_checkpoint_path, checkpoint_every_seconds,
-    epoch_index, seed,
+    neighbour_future_loss_weight, checkpoint_path, previous_checkpoint_path,
+    checkpoint_every_seconds, epoch_index, seed,
+    completed_steps_before_epoch, total_optimiser_steps,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
-    loss_sums = {"total": 0.0, "regression": 0.0, "classification": 0.0, "heading": 0.0}
+    loss_sums = {
+        "total": 0.0, "regression": 0.0, "classification": 0.0,
+        "heading": 0.0, "neighbour_future": 0.0,
+    }
     window_loss_sums = dict.fromkeys(loss_sums, 0.0)
     seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
     batch_count = 0
@@ -84,13 +123,25 @@ def train_epoch(
         batch = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
             (
-                trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+                trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+                neighbour_future_positions,
             ) = predictor.predict_with_heading(batch)
             total, regression, classification, heading = loss.prediction_loss(
                 trajectories, heading_cosine_sine, confidence_logits,
                 batch["future_positions"], batch["future_headings"], batch["future_mask"],
                 predictor.unit_anchors, reachable_distance_metres, heading_loss_weight,
             )
+            neighbour_future = loss.neighbour_future_loss(
+                neighbour_future_positions,
+                batch["neighbour_future_positions"],
+                batch["neighbour_future_mask"],
+            )
+            total = total + neighbour_future_loss_weight * neighbour_future
+        learning_rate = cosine_learning_rate(
+            completed_steps_before_epoch + batch_count, total_optimiser_steps
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
         optimizer.zero_grad()
         gradient_scaler.scale(total).backward()
         gradient_scaler.step(optimizer)
@@ -102,6 +153,7 @@ def train_epoch(
             "regression": float(regression.detach()),
             "classification": float(classification.detach()),
             "heading": float(heading.detach()),
+            "neighbour_future": float(neighbour_future.detach()),
         }
         for name, value in component_values.items():
             loss_sums[name] += value
@@ -149,7 +201,9 @@ def train_epoch(
                 f"backfilled {100 * window_monitor['backfill_rate']:.0f}% | "
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / window_loss_sums['regression']:.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
+                f"nbr/reg {neighbour_future_loss_weight * window_loss_sums['neighbour_future'] / window_loss_sums['regression']:.4f} | "
                 f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} | "
+                f"lr {learning_rate:.3e} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
                 f"wait {100 * seconds['data_wait'] / elapsed:.0f}% "
                 f"step {100 * seconds['step'] / elapsed:.0f}% "
@@ -166,13 +220,7 @@ def train_epoch(
             if math.isfinite(component_values["total"]):
                 save_checkpoint(
                     checkpoint_path, previous_checkpoint_path,
-                    {
-                        "model_state": predictor.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "epoch_index": epoch_index,
-                        "batch_index": batch_count,
-                        "seed": seed,
-                    },
+                    checkpoint_state(predictor, optimizer, seed, epoch_index, batch_count),
                 )
             else:
                 print(
@@ -194,6 +242,7 @@ def main():
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--heading-loss-weight", type=float, required=True)
+    parser.add_argument("--neighbour-future-loss-weight", type=float, required=True)
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
     parser.add_argument("--resume", action="store_true")
@@ -216,18 +265,49 @@ def main():
     gradient_scaler = GradScaler(enabled=arguments.mixed_precision and device.type == "cuda")
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
+    steps_per_epoch = optimiser_steps_per_epoch(
+        scenario_paths, arguments.workers, arguments.batch_size,
+        not arguments.all_eligible_agents,
+    )
+    total_optimiser_steps = steps_per_epoch * arguments.epochs
+    print(
+        f"{steps_per_epoch} optimiser steps per epoch,"
+        f" {total_optimiser_steps} over {arguments.epochs} epochs",
+        flush=True,
+    )
     previous_checkpoint_path = arguments.checkpoint_path.with_suffix(
         arguments.checkpoint_path.suffix + ".previous"
     )
 
-    start_epoch_index = 0
+    completed_epochs = 0
     if arguments.resume and arguments.checkpoint_path.exists():
         checkpoint = torch.load(arguments.checkpoint_path, map_location=device)
         predictor.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
-        start_epoch_index = checkpoint["epoch_index"] + 1
+        completed_epochs = checkpoint["completed_epochs"]
+        interrupted_batches = checkpoint["batch_index"]
+        print(
+            f"resuming {arguments.checkpoint_path}: {completed_epochs} epochs complete"
+            + (
+                ""
+                if interrupted_batches is None
+                else f", epoch {completed_epochs + 1} was {interrupted_batches} batches in"
+                f" when it was checkpointed and restarts from its first batch"
+            ),
+            flush=True,
+        )
 
-    for epoch_index in range(start_epoch_index, arguments.epochs):
+    remaining_epochs = epochs_left_to_train(completed_epochs, arguments.epochs)
+    if not remaining_epochs:
+        print(
+            f"NOTHING TO TRAIN: {arguments.checkpoint_path} already holds {completed_epochs}"
+            f" completed epochs and --epochs is {arguments.epochs}."
+            f" Raise --epochs above {completed_epochs} to train further.",
+            flush=True,
+        )
+        return
+
+    for epoch_index in remaining_epochs:
         batches = pipeline.batches(
             scenario_paths, arguments.workers, arguments.batch_size,
             arguments.prefetch, arguments.seed + epoch_index,
@@ -235,14 +315,17 @@ def main():
         )
         averages, monitor, seconds = train_epoch(
             predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
+            arguments.neighbour_future_loss_weight,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
+            epoch_index * steps_per_epoch, total_optimiser_steps,
         )
         print(
             f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
             f" + cls {averages['classification']:.4f}"
-            f" + hdg {averages['heading']:.4f}) | "
+            f" + hdg {averages['heading']:.4f}"
+            f" + nbr {averages['neighbour_future']:.4f}) | "
             f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
             f"kept modes {monitor['mean_kept_modes']:.2f}"
             f" | backfilled {100 * monitor['backfill_rate']:.0f}% | "
@@ -259,13 +342,7 @@ def main():
             continue
         save_checkpoint(
             arguments.checkpoint_path, previous_checkpoint_path,
-            {
-                "model_state": predictor.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "epoch_index": epoch_index,
-                "batch_index": None,
-                "seed": arguments.seed,
-            },
+            checkpoint_state(predictor, optimizer, arguments.seed, epoch_index + 1, None),
         )
 
 

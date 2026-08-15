@@ -177,6 +177,11 @@ def map_feature_boundary_crossing_codes(feature, raw_points, dot_count):
     sample_distances = polyline_sample_distances(arc_lengths, contract.MAP_POINT_SPACING_METRES)
     for side_index, side_name in enumerate(contract.LANE_SIDES):
         for segment in getattr(feature.lane, f"{side_name}_boundaries"):
+            assert segment.boundary_type < len(contract.ROAD_LINE_TYPES), (
+                f"boundary type {segment.boundary_type} on the {side_name} of lane {feature.id}"
+                f" is past the {len(contract.ROAD_LINE_TYPES)} road line types a crossing code"
+                f" encodes, so it would store a code the map dot encoder cannot one-hot"
+            )
             first_dot = np.searchsorted(sample_distances, arc_lengths[segment.lane_start_index], side="left")
             last_dot = np.searchsorted(sample_distances, arc_lengths[segment.lane_end_index], side="right")
             crossing_codes[first_dot:last_dot, side_index] = 1.0 + segment.boundary_type
@@ -254,8 +259,9 @@ def scenario_traffic_signal_histories(scenario):
 #   stays per dot because it is geometry the dot encoder reads against that dot's own position.
 # CROSS [30:32]: lanes only — the BoundarySegment covering this dot on its left and on its right,
 #   as a CODE not a one-hot, since a dot has at most one boundary per side. 0 = no segment covers
-#   this dot on that side; a recorded type is 1 + its index into BOUNDARY_TYPES, keeping "absent"
-#   distinct from BOUNDARY_TYPES[0] = TYPE_UNKNOWN. lane_start_index / lane_end_index name RAW
+#   this dot on that side; a recorded type is 1 + its index into ROAD_LINE_TYPES, the enum
+#   BoundarySegment.boundary_type actually holds, keeping "absent" distinct from
+#   ROAD_LINE_TYPES[0] = TYPE_UNKNOWN. lane_start_index / lane_end_index name RAW
 #   polyline points, so they are read as arc lengths and matched against each resampled dot's own
 #   sample distance, never scaled. Overlapping segments: proto order, last one wins.
 def map_feature_rows(feature, origin, heading, signal_histories, signal_stop_points):

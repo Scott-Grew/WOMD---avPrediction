@@ -7,6 +7,8 @@ import pytest
 import torch
 
 import fit_anchors
+import measure_sensitivity
+import submit
 import train
 from waymo_open_dataset.protos import scenario_pb2
 from womd import baseline, contract, frame_ops, loader, loss, metrics, model, pipeline, store, tfrecord
@@ -169,6 +171,7 @@ def test_lane_context_walks_connections_forward_only_and_charges_the_lane_left_b
         "feature_ids": np.array([101, 102, 103], dtype=np.int64),
         "map_dot_polyline_index": np.repeat(np.arange(3), feature_lengths),
         "lane_connections": np.array([[101, 102, 1], [103, 101, 1]], dtype=np.int64),
+        "lane_neighbour_ids": np.zeros((0, contract.LANE_NEIGHBOUR_ID_WIDTH), dtype=np.int64),
         "stop_sign_controlled_lanes": np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
     }
 
@@ -189,6 +192,66 @@ def test_lane_context_walks_connections_forward_only_and_charges_the_lane_left_b
     )
     assert upstream_only[contract.LANE_CONTEXT_REACHABLE] == 0.0
     assert upstream_only[contract.LANE_CONTEXT_GRAPH_DISTANCE] == 0.0
+
+
+def test_a_lane_reached_only_sideways_is_flagged_a_lane_change_at_the_distance_it_changed_from():
+    parallel_lane_rows = lane_polyline_rows(20.0, 11)
+    parallel_lane_rows[:, contract.MAP_POSITION.start + 1] = 3.5
+    feature_lengths = np.array([11, 11, 11], dtype=np.int64)
+    scenario_array = {
+        "map_rows": np.concatenate(
+            [lane_polyline_rows(0.0, 11), lane_polyline_rows(20.0, 11), parallel_lane_rows]
+        ),
+        "feature_lengths": feature_lengths,
+        "feature_ids": np.array([101, 102, 103], dtype=np.int64),
+        "map_dot_polyline_index": np.repeat(np.arange(3), feature_lengths),
+        "lane_connections": np.array([[101, 102, 1]], dtype=np.int64),
+        "lane_neighbour_ids": np.array(
+            [[102, 103, contract.LANE_SIDES.index("left")]], dtype=np.int64
+        ),
+        "stop_sign_controlled_lanes": np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
+    }
+
+    own_lane, one_hop_downstream, sideways_only = loader.lane_context_per_polyline(
+        scenario_array, np.array([5.0, 0.0]), np.array([1.0, 0.0])
+    )
+
+    assert one_hop_downstream[contract.LANE_CONTEXT_REACHABLE] == 1.0
+    assert one_hop_downstream[contract.LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE] == 0.0
+    assert sideways_only[contract.LANE_CONTEXT_REACHABLE] == 0.0
+    assert sideways_only[contract.LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE] == 1.0
+    assert own_lane[contract.LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE] == 0.0
+    assert sideways_only[contract.LANE_CONTEXT_GRAPH_DISTANCE] == pytest.approx(
+        one_hop_downstream[contract.LANE_CONTEXT_GRAPH_DISTANCE], rel=1e-6
+    )
+    assert sideways_only[contract.LANE_CONTEXT_GRAPH_DISTANCE] == pytest.approx(
+        10.0 / contract.DISTANCE_NORMALISER_METRES, rel=1e-6
+    )
+
+
+def test_neighbour_future_loss_scores_only_the_neighbour_steps_that_were_logged():
+    torch.manual_seed(23)
+    logged_positions = torch.randn(2, 3, contract.FUTURE_STEPS, 2)
+    neighbour_future_mask = torch.ones(2, 3, contract.FUTURE_STEPS, dtype=torch.bool)
+    neighbour_future_mask[:, 2] = False
+
+    predicted_positions = logged_positions.clone()
+    exact = loss.neighbour_future_loss(
+        predicted_positions, logged_positions, neighbour_future_mask
+    )
+    assert torch.isfinite(exact) and float(exact) == 0.0
+
+    predicted_positions[:, 2] = 1e6
+    assert float(
+        loss.neighbour_future_loss(predicted_positions, logged_positions, neighbour_future_mask)
+    ) == 0.0
+
+    predicted_positions[:, 0] = logged_positions[:, 0] + torch.tensor([3.0, 4.0])
+    scored = loss.neighbour_future_loss(
+        predicted_positions, logged_positions, neighbour_future_mask
+    )
+    assert torch.isfinite(scored)
+    assert float(scored) == pytest.approx(2.5, rel=1e-5)
 
 
 def test_padded_chunk_slot_stays_exactly_zero_through_both_map_projections():
@@ -285,6 +348,44 @@ def test_v4_anchor_null_drives_the_reachable_distance_to_each_most_used_anchor_i
     assert torch.allclose(steps, steps[..., :1, :].expand_as(steps), atol=1e-5)
 
 
+def test_v4_lane_null_drives_the_centreline_at_the_logged_speed_and_forks_into_separate_routes():
+    turning_lane = lane_polyline_rows(0.0, 21)
+    turning_lane[:, contract.MAP_POSITION] = np.stack([np.full(21, 11.0), np.arange(21.0)], axis=1)
+    turning_lane[:, contract.MAP_DIRECTION] = np.array([0.0, 1.0])
+    feature_lengths = np.array([11, 20, 21], dtype=np.int64)
+
+    speed = 10.0
+    track_rows = np.zeros((1, contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32)
+    track_rows[0, :, contract.AGENT_POSITION] = np.array([2.0, 0.0])
+    track_rows[0, :, contract.AGENT_HEADING_COSINE] = 1.0
+    track_rows[0, :, contract.AGENT_VELOCITY] = np.array([speed, 0.0])
+    scenario_array = {
+        "map_rows": np.concatenate(
+            [lane_polyline_rows(0.0, 11), lane_polyline_rows(11.0, 20), turning_lane]
+        ),
+        "feature_lengths": feature_lengths,
+        "feature_ids": np.array([101, 102, 103], dtype=np.int64),
+        "map_dot_polyline_index": np.repeat(np.arange(3), feature_lengths),
+        "lane_connections": np.array([[101, 102, 1], [101, 103, 1]], dtype=np.int64),
+        "track_rows": track_rows,
+    }
+
+    trajectories, followed_a_lane = baseline.follow_the_lane_predictions(scenario_array, 0)
+    step_metres = speed * baseline.TIMESTEP_SECONDS
+    driven_metres = step_metres * np.arange(1, contract.FUTURE_STEPS + 1)
+
+    assert followed_a_lane
+    assert trajectories.shape == (contract.NUM_PREDICTED_MODES, contract.FUTURE_STEPS, 2)
+    assert np.allclose(
+        trajectories[0], np.stack([driven_metres, np.zeros(contract.FUTURE_STEPS)], axis=1), atol=1e-4
+    )
+    assert np.allclose(
+        np.linalg.norm(np.diff(trajectories[:2], axis=1), axis=-1), step_metres, atol=1e-4
+    )
+    assert np.allclose(trajectories[1, -1], np.array([9.0, 71.0]), atol=1e-4)
+    assert np.array_equal(trajectories[2], trajectories[0])
+
+
 def test_anchor_fitting_recovers_tight_well_separated_clusters_and_leaves_no_anchor_empty():
     random_generator = np.random.default_rng(17)
     cluster_centres = model.unit_anchor_offsets() + torch.tensor(
@@ -370,6 +471,78 @@ def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
     assert (distances <= reachable[:, None, None] * float32_rounding_headroom).all()
 
 
+def total_turning_degrees(polyline):
+    steps = polyline.diff(dim=-2)
+    leading, trailing = steps[..., :-1, :], steps[..., 1:, :]
+    cross = leading[..., 0] * trailing[..., 1] - leading[..., 1] * trailing[..., 0]
+    return torch.atan2(cross.abs(), (leading * trailing).sum(dim=-1)).rad2deg().sum(dim=-1)
+
+
+def test_a_trajectory_cannot_outrun_or_outturn_the_control_polygon_it_is_drawn_through():
+    torch.manual_seed(23)
+    assert model.TRAJECTORY_CONTROL_POINTS < contract.FUTURE_STEPS
+
+    curve_basis = model.bernstein_curve_basis(
+        model.TRAJECTORY_CONTROL_POINTS, contract.FUTURE_STEPS
+    )
+    control_points = 20.0 * torch.randn(512, model.TRAJECTORY_CONTROL_POINTS, 2)
+    curve = torch.matmul(curve_basis[:, 1:], control_points)
+    walked = torch.cat([torch.zeros(512, 1, 2), curve], dim=1)
+    control_polygon = torch.cat([torch.zeros(512, 1, 2), control_points], dim=1)
+
+    assert curve_basis.shape == (contract.FUTURE_STEPS, model.TRAJECTORY_CONTROL_POINTS + 1)
+    assert torch.allclose(curve[:, -1], control_points[:, -1], atol=1e-4)
+    assert (
+        walked.diff(dim=1).norm(dim=-1).sum(dim=-1)
+        <= control_polygon.diff(dim=1).norm(dim=-1).sum(dim=-1)
+    ).all()
+    assert (total_turning_degrees(walked) <= total_turning_degrees(control_polygon)).all()
+
+
+def test_every_emitted_trajectory_stays_in_the_curve_family_after_the_anchors_and_the_fence():
+    torch.manual_seed(31)
+    predictor = model.MotionPredictor(model.unit_anchor_offsets()).eval()
+    with torch.no_grad():
+        predictor.mode_decoder.trajectory_head[-1].weight.mul_(50.0)
+
+    agent_history = torch.randn(3, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
+    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.tensor(
+        [[0.0, 0.0], [12.0, 0.0], [0.0, -25.0]]
+    )
+    map_rows = torch.randn(30, contract.MAP_FEATURE_DIM)
+    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = 0.0
+    batch = {
+        "agent_history": agent_history,
+        "agent_history_mask": torch.ones(3, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(3, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(3, 2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "map_rows": map_rows,
+        "map_dot_polyline_slot": torch.arange(30) // 10,
+        "map_chunk_signal_history": torch.zeros(
+            3, 1, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_chunk_lane_context": torch.zeros(3, 1, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(1),
+    }
+
+    with torch.no_grad():
+        trajectories, _ = predictor(batch)
+    flattened = trajectories.permute(2, 0, 1, 3).reshape(contract.FUTURE_STEPS, -1)
+    curve_basis = predictor.mode_decoder.curve_basis
+    projected = curve_basis @ torch.linalg.lstsq(curve_basis, flattened).solution
+
+    independent_positions = trajectories.std() * torch.randn_like(flattened)
+    independent_residual = (
+        independent_positions - curve_basis @ torch.linalg.lstsq(
+            curve_basis, independent_positions
+        ).solution
+    ).norm()
+
+    assert trajectories.abs().max() > 1.0
+    assert (projected - flattened).norm() < 1e-3 * flattened.norm()
+    assert independent_residual > 0.1 * independent_positions.norm()
+
+
 def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
     torch.manual_seed(29)
     unit_anchors = model.unit_anchor_offsets()
@@ -401,7 +574,7 @@ def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
     swapped_order[[forward_mode, backward_mode]] = swapped_order[[backward_mode, forward_mode]]
     with torch.no_grad():
         endpoints = predictor(batch)[0][0, :, -1]
-        predictor.mode_decoder.unit_anchors.copy_(unit_anchors[swapped_order])
+        predictor.mode_decoder.anchor_offsets.copy_(unit_anchors[swapped_order])
         swapped_endpoints = predictor(batch)[0][0, :, -1]
 
     assert (endpoints[forward_mode] - endpoints[backward_mode]).norm() > 1.0
@@ -411,6 +584,57 @@ def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
         mode for mode in range(model.QUERY_COUNT) if mode not in (forward_mode, backward_mode)
     ]
     assert torch.allclose(swapped_endpoints[untouched_modes], endpoints[untouched_modes], atol=1e-4)
+
+
+def test_a_mode_endpoint_carries_its_anchor_at_the_distance_the_loss_assigns_by():
+    torch.manual_seed(37)
+    unit_anchors = model.unit_anchor_offsets()
+    predictor = model.MotionPredictor(unit_anchors).eval()
+    with torch.no_grad():
+        predictor.mode_decoder.trajectory_head[-1].weight.zero_()
+        predictor.mode_decoder.trajectory_head[-1].bias.zero_()
+
+    agent_history = torch.randn(2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
+    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.tensor(
+        [[7.0, 0.0], [0.0, 0.0]]
+    )
+    map_rows = torch.randn(20, contract.MAP_FEATURE_DIM)
+    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = 0.0
+    batch = {
+        "agent_history": agent_history,
+        "agent_history_mask": torch.ones(2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(2, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(2, 2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "map_rows": map_rows,
+        "map_dot_polyline_slot": torch.arange(20) // 10,
+        "map_chunk_signal_history": torch.zeros(
+            2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_chunk_lane_context": torch.zeros(2, 2, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(2),
+    }
+
+    reachable_distance_metres = model.agent_reachable_distance(agent_history)
+    with torch.no_grad():
+        trajectories, _ = predictor(batch)
+    endpoints = trajectories[:, :, -1]
+
+    assert torch.allclose(
+        endpoints,
+        unit_anchors[None] * reachable_distance_metres[:, None, None],
+        atol=1e-4,
+    )
+
+    ramp = torch.arange(1, contract.FUTURE_STEPS + 1) / contract.FUTURE_STEPS
+    logged_futures = endpoints[0][:, None, :] * ramp[None, :, None]
+    assigned_mode = loss.anchor_assigned_mode(
+        predictor.unit_anchors,
+        reachable_distance_metres[:1].expand(model.QUERY_COUNT),
+        logged_futures,
+        torch.ones(model.QUERY_COUNT, contract.FUTURE_STEPS, dtype=torch.bool),
+    )
+
+    assert torch.equal(assigned_mode, torch.arange(model.QUERY_COUNT))
 
 
 def test_opposed_logged_endpoints_are_assigned_to_opposed_anchor_territories():
@@ -463,15 +687,25 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     batch = next(iter(pipeline.batches(scenario_paths, 0, 2, 0, 0, True)))
 
     (
-        trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+        trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+        neighbour_future_positions,
     ) = predictor.predict_with_heading(batch)
+    assert neighbour_future_positions.shape == (
+        batch["neighbour_future_positions"].shape[:2] + (contract.FUTURE_STEPS, 2)
+    )
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, confidence_logits,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
         predictor.unit_anchors, reachable_distance_metres, 1.0,
     )
+    neighbour_future = loss.neighbour_future_loss(
+        neighbour_future_positions,
+        batch["neighbour_future_positions"],
+        batch["neighbour_future_mask"],
+    )
     assert torch.stack(components).isfinite().all()
-    components[0].backward()
+    assert torch.isfinite(neighbour_future)
+    (components[0] + neighbour_future).backward()
     assert all(parameter.grad is not None for parameter in predictor.parameters())
     assert any(parameter.grad.abs().sum() > 0.0 for parameter in predictor.parameters())
     optimizer.step()
@@ -489,4 +723,53 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     assert all(
         torch.equal(reloaded_state[name], parameter)
         for name, parameter in predictor.state_dict().items()
+    )
+
+
+def test_submission_world_frame_returns_the_logged_future_to_its_logged_place():
+    scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:1]
+    if not scenario_paths:
+        pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
+
+    scenario_array = loader.read_scenario(scenario_paths[0])
+    track_index = int(loader.eligible_track_indices(
+        scenario_array["track_rows"], scenario_array["track_valid"],
+        scenario_array["is_designated_target"], True,
+    )[0])
+    sample = loader.build_sample(scenario_array, track_index)
+    agent_frame_future = sample["future_positions"]
+
+    world_future = submit.agent_frame_to_world_frame(agent_frame_future, sample, scenario_array)
+    world_coordinate_resolution = np.finfo(np.float32).eps * np.abs(world_future).max()
+
+    back_to_storage_frame = frame_ops.positions_to_agent_frame(
+        world_future, scenario_array["frame_origin"], scenario_array["frame_heading"]
+    )
+    back_to_agent_frame = frame_ops.positions_to_agent_frame(
+        back_to_storage_frame, sample["frame_origin"], sample["frame_heading"]
+    )
+    assert np.allclose(back_to_agent_frame, agent_frame_future, atol=world_coordinate_resolution)
+
+    logged_world_future = frame_ops.positions_to_world_frame(
+        scenario_array["track_rows"][
+            track_index, contract.CURRENT_STEP_INDEX + 1:, contract.AGENT_POSITION
+        ],
+        scenario_array["frame_origin"], scenario_array["frame_heading"],
+    )
+    logged = scenario_array["track_valid"][track_index, contract.CURRENT_STEP_INDEX + 1:]
+    assert logged.any()
+    assert np.allclose(
+        world_future[logged], logged_world_future[logged], atol=world_coordinate_resolution
+    )
+
+
+def test_every_feature_column_the_contract_declares_has_a_sensitivity_perturbation():
+    measure_sensitivity.assert_selectors_cover_every_column(
+        measure_sensitivity.AGENT_FEATURE_SELECTORS, contract.AGENT_FEATURE_DIM, "agent"
+    )
+    measure_sensitivity.assert_selectors_cover_every_column(
+        measure_sensitivity.MAP_FEATURE_SELECTORS, contract.MAP_FEATURE_DIM, "map"
+    )
+    measure_sensitivity.assert_selectors_cover_every_column(
+        measure_sensitivity.LANE_CONTEXT_SELECTORS, contract.LANE_CONTEXT_DIM, "lane context"
     )

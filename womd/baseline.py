@@ -1,16 +1,21 @@
 # > Null baselines: futures nothing learned about this scene, for the model to be read against
-# Each takes the batch MotionPredictor.forward takes and returns what it returns - trajectories in
-# metres in the predicted agent's own frame, plus confidence logits - so metrics.MetricAccumulator
-# scores baseline and model through one path (V4). None has a free parameter: constant velocity
-# assumes the logged velocity persists, CTRV assumes the logged yaw rate persists with it, the
-# anchor null drives straight to the destinations logged futures actually reach, and there is
-# nothing in any of them to tune toward a flattering number.
+# The first three take the batch MotionPredictor.forward takes and return what it returns -
+# trajectories in metres in the predicted agent's own frame, plus confidence logits - so
+# metrics.MetricAccumulator scores baseline and model through one path (V4). The lane-following
+# null takes the staged scenario and a track index instead, because the batch carries no lane
+# graph: the loader compresses the graph to per-chunk reachability and graph distance, which cannot
+# tell one route through a fork from another. None has a free parameter: constant velocity assumes
+# the logged velocity persists, CTRV assumes the logged yaw rate persists with it, the anchor null
+# drives straight to the destinations logged futures actually reach, the lane-following null drives
+# the lane the agent is already in at the speed it is already going, and there is nothing in any of
+# them to tune toward a flattering number.
 
 import math
 
+import numpy as np
 import torch
 
-from womd import contract, model
+from womd import contract, frame_ops, loader, model
 
 # WOMD asks for 8 s of future and contract.FUTURE_STEPS covers exactly that, so a step is 0.1 s -
 # the dataset's 10 Hz logging rate, divided out of the contract rather than typed in.
@@ -105,6 +110,150 @@ def constant_turn_rate_and_velocity(batch):
         [chord_length * torch.cos(chord_direction), chord_length * torch.sin(chord_direction)], dim=-1
     )
     return as_single_mode(position[:, None, :] + displacement)
+
+
+def lane_polylines_by_id(scenario_array):
+    map_rows = scenario_array["map_rows"]
+    feature_lengths = scenario_array["feature_lengths"]
+    feature_ids = scenario_array["feature_ids"]
+    lane_kind_column = contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index("lane")
+    first_dot_of_polyline = np.cumsum(feature_lengths) - feature_lengths
+    polyline_is_lane = map_rows[first_dot_of_polyline, lane_kind_column] == 1.0
+
+    lanes = {}
+    for polyline_row in np.flatnonzero(polyline_is_lane):
+        first_dot = int(first_dot_of_polyline[polyline_row])
+        dot_count = int(feature_lengths[polyline_row])
+        positions = map_rows[first_dot:first_dot + dot_count, contract.MAP_POSITION]
+        arc_length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+        lanes[int(feature_ids[polyline_row])] = (first_dot, dot_count, arc_length)
+    return lanes
+
+
+def nearest_lane_dot(map_rows, lane_dot_indices, agent_position, agent_heading_cosine_sine):
+    lane_dot_rows = map_rows[lane_dot_indices]
+    agent_distances = np.linalg.norm(
+        lane_dot_rows[:, contract.MAP_POSITION] - agent_position, axis=1
+    )
+    return int(lane_dot_indices[loader.nearest_lane_dot_facing_the_agent_way(
+        lane_dot_rows, agent_distances, agent_heading_cosine_sine
+    )])
+
+
+def exit_lanes_in_connection_order(lane_connections):
+    exits_of_lane = {}
+    for source_id, destination_id, _ in lane_connections.tolist():
+        onward = exits_of_lane.setdefault(source_id, [])
+        if destination_id not in onward:
+            onward.append(destination_id)
+    return exits_of_lane
+
+
+def routes_onward(lane_id, remaining_metres, lanes_already_taken, exits_of_lane, lanes):
+    onward_lane_ids = [
+        destination_id
+        for destination_id in exits_of_lane.get(lane_id, ())
+        if destination_id in lanes and destination_id not in lanes_already_taken
+    ]
+    if remaining_metres <= 0.0 or not onward_lane_ids:
+        return [[]]
+
+    routes = []
+    for destination_id in onward_lane_ids:
+        for continuation in routes_onward(
+            destination_id,
+            remaining_metres - lanes[destination_id][2],
+            lanes_already_taken | {destination_id},
+            exits_of_lane,
+            lanes,
+        ):
+            routes.append([destination_id] + continuation)
+            if len(routes) == contract.NUM_PREDICTED_MODES:
+                return routes
+    return routes
+
+
+def positions_along_polyline(polyline_positions, final_direction, travelled_metres):
+    arc_length = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(polyline_positions, axis=0), axis=1))]
+    )
+    sampled = np.stack(
+        [np.interp(travelled_metres, arc_length, polyline_positions[:, axis]) for axis in (0, 1)],
+        axis=1,
+    )
+    beyond_end = travelled_metres > arc_length[-1]
+    sampled[beyond_end] = (
+        polyline_positions[-1]
+        + (travelled_metres[beyond_end] - arc_length[-1])[:, None] * final_direction
+    )
+    return sampled
+
+
+def as_repeated_modes(storage_frame_trajectories, origin, heading):
+    agent_frame = frame_ops.positions_to_agent_frame(storage_frame_trajectories, origin, heading)
+    filled = np.arange(contract.NUM_PREDICTED_MODES) % len(agent_frame)
+    return agent_frame[filled].astype(np.float32)
+
+
+def follow_the_lane_predictions(scenario_array, track_index):
+    track_rows = scenario_array["track_rows"]
+    now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
+    origin, heading = loader.sample_frame(track_rows, track_index)
+    elapsed_seconds = TIMESTEP_SECONDS * np.arange(1, contract.FUTURE_STEPS + 1)
+    speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
+
+    lanes = lane_polylines_by_id(scenario_array)
+    if not lanes:
+        straight_line = (
+            now_row[contract.AGENT_POSITION]
+            + now_row[contract.AGENT_VELOCITY] * elapsed_seconds[:, None]
+        )
+        return as_repeated_modes(straight_line[None], origin, heading), False
+
+    map_rows = scenario_array["map_rows"]
+    lane_dot_indices = np.concatenate(
+        [np.arange(first_dot, first_dot + dot_count) for first_dot, dot_count, _ in lanes.values()]
+    )
+    start_dot = nearest_lane_dot(
+        map_rows,
+        lane_dot_indices,
+        now_row[contract.AGENT_POSITION],
+        now_row[contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
+    )
+    start_lane_id = int(
+        scenario_array["feature_ids"][scenario_array["map_dot_polyline_index"][start_dot]]
+    )
+    first_dot, dot_count, _ = lanes[start_lane_id]
+    start_lane_dots = np.arange(start_dot, first_dot + dot_count)
+    metres_left_on_start_lane = float(
+        np.linalg.norm(
+            np.diff(map_rows[start_lane_dots][:, contract.MAP_POSITION], axis=0), axis=1
+        ).sum()
+    )
+
+    routes = routes_onward(
+        start_lane_id,
+        speed * FUTURE_HORIZON_SECONDS - metres_left_on_start_lane,
+        {start_lane_id},
+        exit_lanes_in_connection_order(scenario_array["lane_connections"]),
+        lanes,
+    )
+
+    travelled_metres = speed * elapsed_seconds
+    route_trajectories = []
+    for route in routes:
+        route_dots = np.concatenate(
+            [start_lane_dots]
+            + [np.arange(lanes[lane_id][0], lanes[lane_id][0] + lanes[lane_id][1]) for lane_id in route]
+        )
+        route_trajectories.append(
+            positions_along_polyline(
+                map_rows[route_dots][:, contract.MAP_POSITION],
+                map_rows[route_dots[-1], contract.MAP_DIRECTION],
+                travelled_metres,
+            )
+        )
+    return as_repeated_modes(np.stack(route_trajectories), origin, heading), True
 
 
 def straight_lines_to_most_used_anchors(batch, unit_anchors):

@@ -198,6 +198,22 @@ PRUNE_DISTANCE_METRES = 2.5
 ANCHOR_DIRECTION_COUNT = 6
 ANCHOR_DISTANCE_COUNT = 3
 assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
+TRAJECTORY_CONTROL_POINTS = 3
+
+
+def bernstein_curve_basis(control_point_count, step_count):
+    time_fraction = torch.arange(1, step_count + 1, dtype=torch.float32) / step_count
+    control_indices = torch.arange(control_point_count + 1, dtype=torch.float32)
+    log_binomial_coefficients = (
+        torch.lgamma(torch.tensor(control_point_count + 1.0))
+        - torch.lgamma(control_indices + 1.0)
+        - torch.lgamma(control_point_count - control_indices + 1.0)
+    )
+    return (
+        log_binomial_coefficients.exp()
+        * time_fraction[:, None] ** control_indices
+        * (1.0 - time_fraction[:, None]) ** (control_point_count - control_indices)
+    )
 
 
 
@@ -224,8 +240,8 @@ def agent_reachable_distance(agent_history):
     )
 
 
-# The head's whole trajectory is a FRACTION of that distance rather than a set of positions, so a
-# future the agent could not drive is unrepresentable instead of penalised - no loss term, no
+# The head's whole curve is a FRACTION of the budget it is handed rather than a set of positions, so
+# a future the agent could not drive is unrepresentable instead of penalised - no loss term, no
 # weight, no number to choose. The budget is spent on the PATH the trajectory traces, not on how
 # far its endpoint lands: displacement never exceeds arc length, so bounding the path bounds the
 # endpoint too, while the endpoint form permits a mode to reach the 8 s radius at 2 s and come back
@@ -242,19 +258,19 @@ def agent_reachable_distance(agent_history):
 # part of the map and costs no resolution, and flooring the divisor at the dtype's own eps keeps
 # the exactly zero path finite.
 # The squash reads the MEAN step, not the summed path, and the first form shipped without that
-# division was measured broken: the head emits one pair per step, so a path is contract.FUTURE_STEPS
-# terms of the size the endpoint form squashed one of, and tanh saturates. Measured on an untrained
+# division was measured broken: a trajectory is contract.FUTURE_STEPS positions, so a path is
+# contract.FUTURE_STEPS terms of the size the endpoint form squashed one of, and tanh saturates. Measured on an untrained
 # model over ../data/staged, 2026-08-15: the endpoint form put 0.064 into tanh, the summed path put
 # 13.3, and tanh(13.3) is 1.000000 to every digit. A saturated squash is not a fence - it is an
 # instruction to spend the entire budget, and the 100-epoch run it shipped in did exactly that,
 # predicting 114 m of driving for a stopped car whose logged future walks 10 m, at a path/budget
 # ratio of 1.000 at every percentile. Dividing by the step count is not a chosen constant; it is the
 # count the sum ran over, and it returns tanh's input to the scale the endpoint form worked at.
-def fence_to_reachable_path_length(raw_position, reachable_distance_metres):
+def fence_to_path_length_budget(raw_position, path_length_budget_metres):
     steps = torch.cat([raw_position[..., :1, :], raw_position.diff(dim=-2)], dim=-2)
     path_length = steps.norm(dim=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
     mean_step_length = path_length / contract.FUTURE_STEPS
-    fenced_length = torch.tanh(mean_step_length) * reachable_distance_metres.view(-1, 1, 1, 1)
+    fenced_length = torch.tanh(mean_step_length) * path_length_budget_metres
     return raw_position * fenced_length / path_length.clamp_min(torch.finfo(raw_position.dtype).eps)
 
 
@@ -263,46 +279,86 @@ def fence_to_reachable_path_length(raw_position, reachable_distance_metres):
 # handed and free to move. There is no default: which futures each mode is assigned is a modelling
 # claim, so a caller states where its anchors come from rather than inheriting one from this file.
 # The anchor is added to the query so the mode knows which territory it holds, and again to the
-# head's raw position so the anchor sits in the output and is pulled by the regression term of the
-# mode it was assigned to; both additions happen in budget-fraction space, before the fence, so the
-# fence still bounds the whole trajectory. Each query cross-attends over the scene tokens and a
+# curve, ramped over the horizon so it arrives in full at the endpoint and leaves the origin start
+# untouched, so the anchor sits in the output and is pulled by the regression term of the
+# mode it was assigned to. That second addition is in METRES, at unit_anchor * reachable_distance -
+# the endpoint loss.anchor_assigned_mode assigns logged futures by and the one
+# baseline.straight_lines_to_most_used_anchors drives to - so one definition of an anchor holds in
+# all four places. Adding it in budget-fraction space before the fence did not: the fence rescales by
+# tanh(path / FUTURE_STEPS) * reachable / path, so a fraction-space anchor reached the endpoint
+# divided by FUTURE_STEPS, 0.629 m against the loss's 50.343 m for the same anchor.
+# The anchor's own straight ramp costs |unit_anchor| * reachable of the path budget, so the curve is
+# fenced to what is LEFT and the two sum to at most the budget: every step is an anchor step plus a
+# curve step, and the triangle inequality bounds the path by |unit_anchor| * reachable plus
+# (1 - |unit_anchor|) * reachable. The split needs the anchor to name a destination inside the
+# reachable set, which is what the unit_anchors projection guarantees - a fraction beyond 1 claims
+# the agent can outrun its own acceleration limit - and the projection is the identity on anchors
+# k-means fits, since it fits them on endpoints the same budget already bounds.
+# Each query cross-attends over the scene tokens and a
 # SHARED head writes its trajectory + confidence - modes differ by their query vector and by their
-# anchor, so query count is a config number. The head writes four numbers per future
-# step: two position, then the heading as a cosine/sine PAIR rather than an angle, so nothing
+# anchor, so query count is a config number. The head writes TRAJECTORY_CONTROL_POINTS position
+# pairs, which the Bernstein basis evaluates into the contract.FUTURE_STEPS positions, and then the
+# heading as a cosine/sine PAIR per future step rather than an angle, so nothing
 # downstream has to wrap. Only the position half passes through the fence - a cosine/sine pair is
 # unit-scale already and loss.py normalises it to the unit circle before scoring it.
 class ModeDecoder(nn.Module):
     def __init__(self, initial_unit_anchors):
         super().__init__()
         self.queries = nn.Parameter(torch.randn(QUERY_COUNT, HIDDEN_DIM) * 0.02)
-        self.unit_anchors = nn.Parameter(initial_unit_anchors.detach().clone())
+        self.anchor_offsets = nn.Parameter(initial_unit_anchors.detach().clone())
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
         self.cross_attention = MultiHeadAttention()
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
-            nn.Linear(FEEDFORWARD_DIM, contract.FUTURE_STEPS * 4),
+            nn.Linear(
+                FEEDFORWARD_DIM,
+                2 * (TRAJECTORY_CONTROL_POINTS + contract.FUTURE_STEPS),
+            ),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
+        self.register_buffer(
+            "curve_basis",
+            bernstein_curve_basis(TRAJECTORY_CONTROL_POINTS, contract.FUTURE_STEPS)[:, 1:],
+            persistent=False,
+        )
+        self.register_buffer(
+            "anchor_ramp",
+            torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32)
+            / contract.FUTURE_STEPS,
+            persistent=False,
+        )
+
+    @property
+    def unit_anchors(self):
+        return self.anchor_offsets / self.anchor_offsets.norm(dim=-1, keepdim=True).clamp_min(1.0)
 
     def forward(self, tokens, token_present, reachable_distance_metres):
         batch_size = tokens.shape[0]
-        anchored_queries = self.queries + self.anchor_projection(self.unit_anchors)
+        unit_anchors = self.unit_anchors
+        anchored_queries = self.queries + self.anchor_projection(unit_anchors)
         queries = anchored_queries.unsqueeze(0).expand(batch_size, -1, -1)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
-        position_and_heading = self.trajectory_head(read).view(
-            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 4
+        head_output = self.trajectory_head(read)
+        control_points = head_output[..., : 2 * TRAJECTORY_CONTROL_POINTS].view(
+            batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2
+        )
+        heading_cosine_sine = head_output[..., 2 * TRAJECTORY_CONTROL_POINTS:].view(
+            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2
         )
         confidence_logits = self.confidence_head(read).squeeze(-1)
+        anchor_endpoints = unit_anchors[None, :, :] * reachable_distance_metres[:, None, None]
+        curve_budget_metres = (
+            reachable_distance_metres[:, None] - anchor_endpoints.norm(dim=-1)
+        ).clamp_min(0.0)[:, :, None, None]
         anchored_position = (
-            position_and_heading[..., :2] + self.unit_anchors[None, :, None, :]
+            fence_to_path_length_budget(
+                torch.matmul(self.curve_basis, control_points), curve_budget_metres
+            )
+            + anchor_endpoints[:, :, None, :] * self.anchor_ramp[None, None, :, None]
         )
-        return (
-            fence_to_reachable_path_length(anchored_position, reachable_distance_metres),
-            position_and_heading[..., 2:],
-            confidence_logits,
-        )
+        return anchored_position, heading_cosine_sine, confidence_logits
 
 
 # Confidence-ordered endpoint pruning (MTR's reduction): walk modes by descending confidence,
@@ -392,28 +448,54 @@ def prune_modes_batched(trajectories, confidence_logits):
     return kept_trajectories, kept_confidence_logits
 
 
+class NeighbourFutureHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_norm = nn.LayerNorm(HIDDEN_DIM)
+        self.network = nn.Sequential(
+            nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
+            nn.ReLU(),
+            nn.Linear(FEEDFORWARD_DIM, 2 * contract.FUTURE_STEPS),
+        )
+
+    def forward(self, neighbour_tokens):
+        positions = self.network(self.token_norm(neighbour_tokens))
+        return positions.view(*neighbour_tokens.shape[:2], contract.FUTURE_STEPS, 2)
+
+
 # Training reads all 64 modes; prune_modes runs only at evaluation/submission. forward keeps the
 # (trajectories in metres, confidence logits) pair the metric accumulator, the null baselines and
-# the submission path all speak; the auxiliary heading is a training-only output and is reached
-# through predict_with_heading, which the epoch loop calls instead.
+# the submission path all speak, and pays for nothing else; the auxiliary heading and the neighbour
+# futures are training-only outputs and are reached through predict_with_heading, which the epoch
+# loop calls instead.
 class MotionPredictor(nn.Module):
     def __init__(self, initial_unit_anchors):
         super().__init__()
         self.scene_encoder = SceneEncoder()
         self.mode_decoder = ModeDecoder(initial_unit_anchors)
+        self.neighbour_future_head = NeighbourFutureHead()
 
     @property
     def unit_anchors(self):
         return self.mode_decoder.unit_anchors
 
-    def predict_with_heading(self, batch):
+    def encode_scene_and_modes(self, batch):
         tokens, token_present = self.scene_encoder(batch)
         reachable_distance_metres = agent_reachable_distance(batch["agent_history"])
         trajectories, heading_cosine_sine, confidence_logits = self.mode_decoder(
             tokens, token_present, reachable_distance_metres
         )
-        return trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+        return tokens, trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+
+    def predict_with_heading(self, batch):
+        (
+            tokens, trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+        ) = self.encode_scene_and_modes(batch)
+        neighbour_count = batch["neighbour_history"].shape[1]
+        neighbour_future_positions = self.neighbour_future_head(tokens[:, 1:1 + neighbour_count])
+        return (trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+                neighbour_future_positions)
 
     def forward(self, batch):
-        trajectories, _, confidence_logits, _ = self.predict_with_heading(batch)
+        _, trajectories, _, confidence_logits, _ = self.encode_scene_and_modes(batch)
         return trajectories, confidence_logits
