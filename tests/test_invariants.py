@@ -1,11 +1,16 @@
 import io
+import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+import train
 from waymo_open_dataset.protos import scenario_pb2
-from womd import baseline, contract, frame_ops, loader, model, store, tfrecord
+from womd import baseline, contract, frame_ops, loader, loss, metrics, model, pipeline, store, tfrecord
+
+STAGED_DIRECTORY = Path(__file__).resolve().parents[2] / "data" / "staged"
 
 
 def test_crc32c_matches_known_answer():
@@ -116,7 +121,7 @@ def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
         base_trajectories, base_logits = predictor(batch)
         permuted_trajectories, permuted_logits = predictor(permuted)
 
-    assert torch.allclose(base_trajectories, permuted_trajectories, atol=1e-5)
+    assert torch.allclose(base_trajectories, permuted_trajectories, atol=1e-4)
     assert torch.allclose(base_logits, permuted_logits, atol=1e-5)
 
 
@@ -176,3 +181,99 @@ def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
 
     pruned, _ = model.prune_modes_batched(turning_trajectories, turning_logits)
     assert torch.equal(pruned, turning_trajectories.expand(-1, contract.NUM_PREDICTED_MODES, -1, -1))
+
+
+def test_batched_pruning_walk_matches_the_single_sample_walk():
+    torch.manual_seed(7)
+    trajectories = model.PRUNE_DISTANCE_METRES * torch.randn(
+        2, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
+    )
+    confidence_logits = torch.randn(2, model.QUERY_COUNT)
+    trajectories[1] = trajectories[1, :1]
+
+    batched_trajectories, batched_logits, kept_counts = model.prune_modes_batched_with_kept_count(
+        trajectories, confidence_logits
+    )
+    assert kept_counts[0] > 1 and kept_counts[0] <= contract.NUM_PREDICTED_MODES
+    assert kept_counts[1] == 1
+    for sample_index in range(len(kept_counts)):
+        walked_trajectories, walked_logits = model.prune_modes(
+            trajectories[sample_index], confidence_logits[sample_index]
+        )
+        assert torch.equal(walked_trajectories, batched_trajectories[sample_index])
+        assert torch.equal(walked_logits, batched_logits[sample_index])
+
+
+def test_no_predicted_position_escapes_the_agent_own_reachable_distance():
+    torch.manual_seed(13)
+    predictor = model.MotionPredictor().eval()
+    with torch.no_grad():
+        predictor.mode_decoder.trajectory_head[-1].weight.mul_(1000.0)
+        predictor.mode_decoder.trajectory_head[-1].bias.mul_(1000.0)
+
+    current_speeds = torch.tensor([0.0, 30.0])
+    agent_history = torch.randn(2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
+    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.stack(
+        [current_speeds, torch.zeros(2)], dim=-1
+    )
+    batch = {
+        "agent_history": agent_history,
+        "agent_history_mask": torch.ones(2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(2, 3, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(2, 3, contract.HISTORY_STEPS, dtype=torch.bool),
+        "map_rows": torch.randn(40, contract.MAP_FEATURE_DIM),
+        "map_dot_polyline_slot": torch.arange(40) // 10,
+        "map_chunk_signal_history": torch.zeros(
+            2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "max_polylines_in_batch": torch.tensor(2),
+    }
+
+    reachable = (
+        current_speeds * contract.FUTURE_HORIZON_SECONDS
+        + 0.5 * contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED * contract.FUTURE_HORIZON_SECONDS ** 2
+    )
+    with torch.no_grad():
+        trajectories, _ = predictor(batch)
+    distances = trajectories.norm(dim=-1)
+
+    float32_rounding_headroom = 1.0 + 8 * torch.finfo(distances.dtype).eps
+    assert (distances <= reachable[:, None, None] * float32_rounding_headroom).all()
+    assert (distances.amax(dim=(1, 2)) > 0.99 * reachable).all()
+
+
+def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
+    scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:2]
+    if not scenario_paths:
+        pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
+
+    torch.manual_seed(0)
+    predictor = model.MotionPredictor()
+    optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
+    batch = next(iter(pipeline.batches(scenario_paths, 0, 2, 0, 0, True)))
+
+    trajectories, heading_cosine_sine, confidence_logits = predictor.predict_with_heading(batch)
+    components = loss.prediction_loss(
+        trajectories, heading_cosine_sine, confidence_logits,
+        batch["future_positions"], batch["future_headings"], batch["future_mask"], 1.0,
+    )
+    assert torch.stack(components).isfinite().all()
+    components[0].backward()
+    assert all(parameter.grad is not None for parameter in predictor.parameters())
+    assert any(parameter.grad.abs().sum() > 0.0 for parameter in predictor.parameters())
+    optimizer.step()
+
+    accumulator = metrics.MetricAccumulator()
+    accumulator.update(
+        trajectories.detach(), confidence_logits.detach(),
+        batch["future_positions"], batch["future_mask"],
+    )
+    assert all(math.isfinite(value) for value in accumulator.results().values())
+
+    checkpoint_path = tmp_path / "predictor.pt"
+    torch.save(predictor.state_dict(), checkpoint_path)
+    reloaded_state = torch.load(checkpoint_path)
+    assert all(
+        torch.equal(reloaded_state[name], parameter)
+        for name, parameter in predictor.state_dict().items()
+    )

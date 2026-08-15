@@ -181,16 +181,48 @@ class SceneEncoder(nn.Module):
         return tokens, token_present
 
 
-QUERY_COUNT = 64
+QUERY_COUNT = 18
 PRUNE_DISTANCE_METRES = 2.5
 
-# 64 learned queries, each a standing question the model owns. Each cross-attends over the
+
+# The furthest this agent could physically get inside the prediction horizon, one distance per
+# sample: its own logged speed at "now" carried for the whole horizon, plus what the project's
+# measured acceleration limit could add on top of that. Every term is the agent's own or measured
+# from logged ground truth, so there is nothing here to tune. The "now" row is real for every
+# sample by construction - loader.eligible_track_indices only makes a sample out of a track valid
+# at contract.CURRENT_STEP_INDEX - so the speed is never read off a padded step, and the loader
+# rotates velocity into the agent's frame, which leaves its length untouched.
+def agent_reachable_distance(agent_history):
+    current_speed = agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY].norm(dim=-1)
+    return (
+        current_speed * contract.FUTURE_HORIZON_SECONDS
+        + 0.5 * contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED * contract.FUTURE_HORIZON_SECONDS ** 2
+    )
+
+
+# The head's position pair is a FRACTION of that distance rather than a position, so a future the
+# agent could not reach is unrepresentable instead of penalised - no loss term, no weight, no
+# number to choose. The squash runs on the pair's LENGTH, not on its two columns: squashing the
+# columns independently would fence a square of side twice the bound, whose corner sits 1.414x
+# outside it, and the bound is a radius, so the fence has to be that radius' disc. The bound is the
+# horizon's, applied at every step, because the acceleration limit under it was measured at a 0.5 s
+# window and §LIMITS rules limit and window inseparable; re-evaluating it at one 0.1 s step reads
+# the differentiation noise that window exists to remove, and measured over 39,259 logged steps a
+# step-scaled bound cuts 224 of them. tanh(length) / length approaches 1 as the length goes to
+# zero, so a short trajectory sits in the linear part of the map and costs no resolution, and
+# flooring the divisor at the dtype's own eps keeps the exactly zero pair finite.
+def fence_to_reachable_disc(raw_position, reachable_distance_metres):
+    length = raw_position.norm(dim=-1, keepdim=True)
+    fenced_length = torch.tanh(length) * reachable_distance_metres.view(-1, 1, 1, 1)
+    return raw_position * fenced_length / length.clamp_min(torch.finfo(raw_position.dtype).eps)
+
+
+# QUERY_COUNT learned queries, each a standing question the model owns. Each cross-attends over the
 # scene tokens and a SHARED head writes its trajectory + confidence - modes differ only by
 # their query vector, so query count is a config number. The head writes four numbers per future
-# step: two normalised position, then the heading as a cosine/sine PAIR rather than an angle, so
-# nothing downstream has to wrap. Only the position half is multiplied back into metres - a
-# cosine/sine pair is unit-scale already and dividing the encoders' distance normaliser into it
-# would inflate it by contract.DISTANCE_NORMALISER_METRES.
+# step: two position, then the heading as a cosine/sine PAIR rather than an angle, so nothing
+# downstream has to wrap. Only the position half passes through the fence - a cosine/sine pair is
+# unit-scale already and loss.py normalises it to the unit circle before scoring it.
 class ModeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -204,7 +236,7 @@ class ModeDecoder(nn.Module):
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
 
-    def forward(self, tokens, token_present):
+    def forward(self, tokens, token_present, reachable_distance_metres):
         batch_size = tokens.shape[0]
         queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
@@ -213,7 +245,7 @@ class ModeDecoder(nn.Module):
         )
         confidence_logits = self.confidence_head(read).squeeze(-1)
         return (
-            position_and_heading[..., :2] * contract.DISTANCE_NORMALISER_METRES,
+            fence_to_reachable_disc(position_and_heading[..., :2], reachable_distance_metres),
             position_and_heading[..., 2:],
             confidence_logits,
         )
@@ -318,7 +350,9 @@ class MotionPredictor(nn.Module):
 
     def predict_with_heading(self, batch):
         tokens, token_present = self.scene_encoder(batch)
-        return self.mode_decoder(tokens, token_present)
+        return self.mode_decoder(
+            tokens, token_present, agent_reachable_distance(batch["agent_history"])
+        )
 
     def forward(self, batch):
         trajectories, _, confidence_logits = self.predict_with_heading(batch)
