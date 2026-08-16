@@ -70,11 +70,11 @@ def track_rows_to_agent_frame(rows, origin, heading):
 # not a chosen number. Falling back to every dot when none agree keeps an agent facing across a road
 # assigned to something rather than to nothing.
 def nearest_lane_dot_facing_the_agent_way(lane_dot_rows, agent_distances, agent_heading_cosine_sine):
-    faces_the_agent_way = lane_dot_rows[:, contract.MAP_DIRECTION] @ agent_heading_cosine_sine > 0.0
-    candidates = np.flatnonzero(faces_the_agent_way)
-    if len(candidates) == 0:
-        candidates = np.arange(len(lane_dot_rows))
-    return int(candidates[np.argmin(agent_distances[candidates])])
+    faces_the_agent_way = (
+        agent_heading_cosine_sine @ lane_dot_rows[:, contract.MAP_DIRECTION].T > 0.0
+    )
+    candidates = faces_the_agent_way | ~faces_the_agent_way.any(axis=1, keepdims=True)
+    return np.where(candidates, agent_distances, np.inf).argmin(axis=1)
 
 def lane_graph_distances(start_lane_id, exits_of_lane, neighbours_of_lane,
                          arc_length_of_polyline, polyline_row_of_lane_id):
@@ -97,32 +97,17 @@ def lane_graph_distances(start_lane_id, exits_of_lane, neighbours_of_lane,
                 heapq.heappush(frontier, (reached_distance, destination_id))
     return graph_distance_metres
 
-def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
+def lane_graph_of_scenario(scenario_array):
     map_rows = scenario_array["map_rows"]
     feature_lengths = scenario_array["feature_lengths"]
     feature_ids = scenario_array["feature_ids"]
     dot_polyline_index = scenario_array["map_dot_polyline_index"]
-    lane_context = np.zeros((len(feature_ids), contract.LANE_CONTEXT_DIM), dtype=np.float32)
 
     lane_kind_column = contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index("lane")
     first_dot_of_polyline = np.cumsum(feature_lengths) - feature_lengths
     polyline_is_lane = map_rows[first_dot_of_polyline, lane_kind_column] == 1.0
     lane_dot_indices = np.flatnonzero(polyline_is_lane[dot_polyline_index])
-    if len(lane_dot_indices) == 0:
-        return lane_context
 
-    lane_dot_rows = map_rows[lane_dot_indices]
-    agent_offsets = lane_dot_rows[:, contract.MAP_POSITION] - agent_position
-    agent_distances = np.linalg.norm(agent_offsets, axis=1)
-    lane_context[:, contract.LANE_CONTEXT_AGENT_LANE_DISTANCE] = (
-        agent_distances.min() / contract.DISTANCE_NORMALISER_METRES
-    )
-    agent_lane_dot = lane_dot_indices[nearest_lane_dot_facing_the_agent_way(
-        lane_dot_rows, agent_distances, agent_heading
-    )]
-    agent_lane_id = int(feature_ids[dot_polyline_index[agent_lane_dot]])
-
-    polyline_row_of_lane_id = {int(feature_id): row for row, feature_id in enumerate(feature_ids)}
     arc_length_of_polyline = np.zeros(len(feature_ids))
     dot_gaps = np.linalg.norm(np.diff(map_rows[:, contract.MAP_POSITION], axis=0), axis=1)
     gap_stays_within_polyline = dot_polyline_index[1:] == dot_polyline_index[:-1]
@@ -140,11 +125,50 @@ def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
     for lane_id, other_lane_id, _ in scenario_array["lane_neighbour_ids"].tolist():
         neighbours_of_lane.setdefault(lane_id, []).append(other_lane_id)
 
+    return {
+        "polyline_count": len(feature_ids),
+        "feature_ids": feature_ids,
+        "polyline_row_of_lane_id": {
+            int(feature_id): row for row, feature_id in enumerate(feature_ids)
+        },
+        "arc_length_of_polyline": arc_length_of_polyline,
+        "exits_of_lane": exits_of_lane,
+        "neighbours_of_lane": neighbours_of_lane,
+        "lane_dot_rows": map_rows[lane_dot_indices],
+        "polyline_row_of_lane_dot": dot_polyline_index[lane_dot_indices],
+        "stop_sign_controlled_lane_ids": scenario_array["stop_sign_controlled_lanes"][
+            :, contract.STOP_SIGN_CONTROLLED_LANE
+        ].tolist(),
+    }
+
+def lane_context_per_polyline(lane_graph, agent_position, agent_heading):
+    lane_context = np.zeros(
+        (lane_graph["polyline_count"], contract.LANE_CONTEXT_DIM), dtype=np.float32
+    )
+    lane_dot_rows = lane_graph["lane_dot_rows"]
+    if len(lane_dot_rows) == 0:
+        return lane_context
+
+    agent_offsets = lane_dot_rows[:, contract.MAP_POSITION] - agent_position
+    agent_distances = np.linalg.norm(agent_offsets, axis=1)
+    lane_context[:, contract.LANE_CONTEXT_AGENT_LANE_DISTANCE] = (
+        agent_distances.min() / contract.DISTANCE_NORMALISER_METRES
+    )
+    agent_lane_dot = int(nearest_lane_dot_facing_the_agent_way(
+        lane_dot_rows, agent_distances[None], agent_heading[None]
+    )[0])
+    agent_lane_id = int(
+        lane_graph["feature_ids"][lane_graph["polyline_row_of_lane_dot"][agent_lane_dot]]
+    )
+
+    polyline_row_of_lane_id = lane_graph["polyline_row_of_lane_id"]
+    arc_length_of_polyline = lane_graph["arc_length_of_polyline"]
+    exits_of_lane = lane_graph["exits_of_lane"]
     forward_distance_metres = lane_graph_distances(
         agent_lane_id, exits_of_lane, {}, arc_length_of_polyline, polyline_row_of_lane_id
     )
     lane_change_distance_metres = lane_graph_distances(
-        agent_lane_id, exits_of_lane, neighbours_of_lane,
+        agent_lane_id, exits_of_lane, lane_graph["neighbours_of_lane"],
         arc_length_of_polyline, polyline_row_of_lane_id,
     )
 
@@ -159,12 +183,39 @@ def lane_context_per_polyline(scenario_array, agent_position, agent_heading):
             distance_metres / contract.DISTANCE_NORMALISER_METRES
         )
 
-    controlled_lanes = scenario_array["stop_sign_controlled_lanes"][:, contract.STOP_SIGN_CONTROLLED_LANE]
-    for controlled_lane_id in controlled_lanes.tolist():
+    for controlled_lane_id in lane_graph["stop_sign_controlled_lane_ids"]:
         if controlled_lane_id in polyline_row_of_lane_id:
             lane_context[polyline_row_of_lane_id[controlled_lane_id],
                          contract.LANE_CONTEXT_HAS_STOP_SIGN] = 1.0
     return lane_context
+
+def assigned_lane_signal_histories(
+    lane_graph, polyline_signal_histories, agent_now_rows, agent_has_now_step
+):
+    signal_histories = np.zeros(
+        (len(agent_now_rows), contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        dtype=np.float32,
+    )
+    lane_dot_rows = lane_graph["lane_dot_rows"]
+    assignable = np.flatnonzero(agent_has_now_step)
+    if len(lane_dot_rows) == 0 or len(assignable) == 0:
+        return signal_histories
+
+    assignable_rows = agent_now_rows[assignable]
+    assignable_positions = assignable_rows[:, contract.AGENT_POSITION]
+    lane_dot_positions = lane_dot_rows[:, contract.MAP_POSITION]
+    offsets_x = lane_dot_positions[None, :, 0] - assignable_positions[:, :1]
+    offsets_y = lane_dot_positions[None, :, 1] - assignable_positions[:, 1:]
+    agent_distances = np.sqrt(offsets_x * offsets_x + offsets_y * offsets_y)
+    assigned_lane_dot = nearest_lane_dot_facing_the_agent_way(
+        lane_dot_rows,
+        agent_distances,
+        assignable_rows[:, contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
+    )
+    signal_histories[assignable] = polyline_signal_histories[
+        lane_graph["polyline_row_of_lane_dot"][assigned_lane_dot]
+    ]
+    return signal_histories
 
 # Crop the map to the agent's view, reframe it, and cut the surviving dots into the chunks that
 # become attention tokens: at most contract.MAP_CHUNK_DOTS consecutive dots of one polyline, so a
@@ -194,6 +245,20 @@ def crop_and_reframe_map(map_rows, dot_polyline_index, polyline_signal_histories
     return (reframed, dot_chunk_index, polyline_signal_histories[chunk_polyline],
             polyline_lane_context[chunk_polyline])
 
+def with_derived_arrays(scenario_array):
+    feature_lengths = scenario_array["feature_lengths"]
+    scenario_array["map_dot_polyline_index"] = np.repeat(
+        np.arange(len(feature_lengths)), feature_lengths
+    )
+    scenario_array["lane_graph"] = lane_graph_of_scenario(scenario_array)
+    scenario_array["track_signal_histories"] = assigned_lane_signal_histories(
+        scenario_array["lane_graph"],
+        scenario_array["polyline_signal_histories"],
+        scenario_array["track_rows"][:, contract.CURRENT_STEP_INDEX],
+        scenario_array["track_valid"][:, contract.CURRENT_STEP_INDEX],
+    )
+    return scenario_array
+
 # feature_lengths is the ONLY thing tying a dot back to the polyline it came from: the dots are one
 # flat block and the lengths cut it. A staging bug that leaves the two out of step shifts every dot
 # after the first bad polyline onto a neighbour's identity, which the model reads as a plausible map
@@ -207,8 +272,7 @@ def read_scenario(scenario_path):
         f"feature_lengths sum to {feature_lengths.sum()} but {scenario_path} holds"
         f" {map_row_count} map rows"
     )
-    scenario_array["map_dot_polyline_index"] = np.repeat(np.arange(len(feature_lengths)), feature_lengths)
-    return scenario_array
+    return with_derived_arrays(scenario_array)
 
 def build_sample(scenario_array, track_index):
     track_rows = scenario_array["track_rows"]
@@ -231,10 +295,11 @@ def build_sample(scenario_array, track_index):
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
     polyline_lane_context = lane_context_per_polyline(
-        scenario_array,
+        scenario_array["lane_graph"],
         now_row[contract.AGENT_POSITION],
         now_row[contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
     )
+    track_signal_histories = scenario_array["track_signal_histories"]
     (agent_map, map_chunk_index, map_chunk_signal_history,
      map_chunk_lane_context) = crop_and_reframe_map(
         scenario_array["map_rows"],
@@ -249,11 +314,13 @@ def build_sample(scenario_array, track_index):
     return {
         "agent_history": agent_track[:contract.HISTORY_STEPS],
         "agent_history_mask": track_valid[track_index, :contract.HISTORY_STEPS],
+        "agent_signal_history": track_signal_histories[track_index],
         "future_positions": future_positions,
         "future_headings": agent_track[contract.CURRENT_STEP_INDEX + 1:, contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
         "future_mask": track_valid[track_index, contract.CURRENT_STEP_INDEX + 1:],
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": track_valid[neighbour_indices, :contract.HISTORY_STEPS],
+        "neighbour_signal_history": track_signal_histories[neighbour_indices],
         "neighbour_future_positions": neighbour_future_positions,
         "neighbour_future_mask": track_valid[neighbour_indices, contract.CURRENT_STEP_INDEX + 1:],
         "map_rows": agent_map,
@@ -290,6 +357,10 @@ def build_batch(samples):
         (batch_size, max_neighbours, contract.FUTURE_STEPS, 2), dtype=np.float32
     )
     neighbour_future_mask = np.zeros((batch_size, max_neighbours, contract.FUTURE_STEPS), dtype=bool)
+    neighbour_signal_history = np.zeros(
+        (batch_size, max_neighbours, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        dtype=np.float32,
+    )
     map_chunk_signal_history = np.zeros(
         (batch_size, max_chunks_in_batch, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
         dtype=np.float32,
@@ -304,6 +375,7 @@ def build_batch(samples):
         neighbour_history_mask[sample_index, :neighbour_count] = sample["neighbour_history_mask"]
         neighbour_future_positions[sample_index, :neighbour_count] = sample["neighbour_future_positions"]
         neighbour_future_mask[sample_index, :neighbour_count] = sample["neighbour_future_mask"]
+        neighbour_signal_history[sample_index, :neighbour_count] = sample["neighbour_signal_history"]
         chunk_count = sample["map_chunk_signal_history"].shape[0]
         map_chunk_signal_history[sample_index, :chunk_count] = sample["map_chunk_signal_history"]
         map_chunk_lane_context[sample_index, :chunk_count] = sample["map_chunk_lane_context"]
@@ -311,11 +383,13 @@ def build_batch(samples):
     return {
         "agent_history": np.stack([sample["agent_history"] for sample in samples]),
         "agent_history_mask": np.stack([sample["agent_history_mask"] for sample in samples]),
+        "agent_signal_history": np.stack([sample["agent_signal_history"] for sample in samples]),
         "future_positions": np.stack([sample["future_positions"] for sample in samples]),
         "future_headings": np.stack([sample["future_headings"] for sample in samples]),
         "future_mask": np.stack([sample["future_mask"] for sample in samples]),
         "neighbour_history": neighbour_history,
         "neighbour_history_mask": neighbour_history_mask,
+        "neighbour_signal_history": neighbour_signal_history,
         "neighbour_future_positions": neighbour_future_positions,
         "neighbour_future_mask": neighbour_future_mask,
         "map_rows": np.concatenate(

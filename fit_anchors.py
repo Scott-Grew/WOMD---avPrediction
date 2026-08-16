@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import loader, model
+from womd import contract, loader, model
 
 MAXIMUM_ITERATIONS = 100
 
@@ -32,7 +32,10 @@ def budget_fraction_endpoints(scenario_paths):
 
     agent_history = torch.from_numpy(np.stack(agent_histories))
     endpoints = torch.from_numpy(np.stack(logged_endpoints))
-    return endpoints / model.agent_reachable_distance(agent_history)[:, None]
+    return (
+        endpoints / model.agent_reachable_distance(agent_history)[:, None],
+        model.predicted_type_index(agent_history),
+    )
 
 
 def endpoints_per_centre(assignment, centre_count):
@@ -78,36 +81,15 @@ def minimum_pairwise_distance(anchors):
     return float(separations.min())
 
 
-def main():
-    staged_directory = Path(sys.argv[1])
-    output_path = Path(sys.argv[2])
-    scenario_paths = sorted(staged_directory.glob("*.npz"))
-
-    start_seconds = time.perf_counter()
-    endpoints = budget_fraction_endpoints(scenario_paths)
-    (
-        centres, assignment, initial_assignment, iteration_count, stopped_by_convergence
-    ) = fit_unit_anchors(endpoints)
-    elapsed_seconds = time.perf_counter() - start_seconds
-
-    sample_count = endpoints.shape[0]
-    fitted_counts = endpoints_per_centre(assignment, model.QUERY_COUNT)
-    share_order = torch.argsort(fitted_counts, descending=True, stable=True)
-    fitted_anchors = centres[share_order]
-    fitted_counts = fitted_counts[share_order]
-    np.savez(output_path, unit_anchors=fitted_anchors.numpy().astype(np.float32))
-
-    geometric_fan = model.unit_anchor_offsets()
-    fan_counts = endpoints_per_centre(initial_assignment, model.QUERY_COUNT)
-
-    print(f"scenarios {len(scenario_paths)} | samples {sample_count} | {elapsed_seconds:.1f} s")
+def print_one_type(
+    type_name, type_sample_count, fitted_anchors, fitted_counts, fan_counts,
+    iteration_count, stopped_by_convergence,
+):
     print(
-        f"k-means ran {iteration_count} iterations, stopped by "
+        f"{type_name} | samples {type_sample_count} | k-means ran {iteration_count} iterations,"
+        f" stopped by "
         f"{'an unchanged assignment' if stopped_by_convergence else f'the {MAXIMUM_ITERATIONS} iteration cap'}"
     )
-    print(f"wrote {output_path}, most-used anchor first")
-    print()
-
     print(f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}{'angle deg':>11}{'share':>9}")
     for anchor_index in range(model.QUERY_COUNT):
         offset_x, offset_y = fitted_anchors[anchor_index].tolist()
@@ -115,22 +97,87 @@ def main():
             f"{anchor_index:>7}{offset_x:>10.3f}{offset_y:>10.3f}"
             f"{math.hypot(offset_x, offset_y):>10.3f}"
             f"{math.degrees(math.atan2(offset_y, offset_x)):>11.1f}"
-            f"{int(fitted_counts[anchor_index]) / sample_count:>9.1%}"
+            f"{int(fitted_counts[anchor_index]) / type_sample_count:>9.1%}"
         )
-    print()
-
     print(f"{'':<28}{'geometric fan':>16}{'fitted':>12}")
     print(
         f"{'anchors with an endpoint':<28}{int((fan_counts > 0).sum()):>16}"
         f"{int((fitted_counts > 0).sum()):>12}"
     )
     print(
-        f"{'largest single share':<28}{int(fan_counts.max()) / sample_count:>16.1%}"
-        f"{int(fitted_counts.max()) / sample_count:>12.1%}"
+        f"{'largest single share':<28}{int(fan_counts.max()) / type_sample_count:>16.1%}"
+        f"{int(fitted_counts.max()) / type_sample_count:>12.1%}"
     )
     print(
-        f"{'minimum pairwise distance':<28}{minimum_pairwise_distance(geometric_fan):>16.3f}"
+        f"{'minimum pairwise distance':<28}"
+        f"{minimum_pairwise_distance(model.unit_anchor_offsets()):>16.3f}"
         f"{minimum_pairwise_distance(fitted_anchors):>12.3f}"
+    )
+    print()
+
+
+def main():
+    staged_directory = Path(sys.argv[1])
+    output_path = Path(sys.argv[2])
+    scenario_paths = sorted(staged_directory.glob("*.npz"))
+
+    start_seconds = time.perf_counter()
+    endpoints, predicted_type_index = budget_fraction_endpoints(scenario_paths)
+    elapsed_seconds = time.perf_counter() - start_seconds
+
+    type_sample_counts = [
+        int((predicted_type_index == type_index).sum())
+        for type_index in range(contract.NUM_OBJECT_TYPES)
+    ]
+    starved_types = [
+        f"{type_name} has {type_sample_count}"
+        for type_name, type_sample_count in zip(
+            contract.PREDICTED_OBJECT_TYPES, type_sample_counts
+        )
+        if type_sample_count < model.QUERY_COUNT
+    ]
+    assert not starved_types, (
+        f"{model.QUERY_COUNT} anchors per type need at least {model.QUERY_COUNT} endpoints per"
+        f" type, but " + ", ".join(starved_types) + f" over {len(scenario_paths)} scenarios of"
+        f" {staged_directory}"
+    )
+
+    print(
+        f"scenarios {len(scenario_paths)} | samples {endpoints.shape[0]}"
+        f" | {elapsed_seconds:.1f} s"
+    )
+    print(
+        "samples per type | "
+        + " ".join(
+            f"{type_name} {type_sample_count}"
+            for type_name, type_sample_count in zip(
+                contract.PREDICTED_OBJECT_TYPES, type_sample_counts
+            )
+        )
+    )
+    print()
+
+    fitted_anchors_per_type = []
+    for type_index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES):
+        type_endpoints = endpoints[predicted_type_index == type_index]
+        (
+            centres, assignment, initial_assignment, iteration_count, stopped_by_convergence
+        ) = fit_unit_anchors(type_endpoints)
+        fitted_counts = endpoints_per_centre(assignment, model.QUERY_COUNT)
+        share_order = torch.argsort(fitted_counts, descending=True, stable=True)
+        fitted_anchors = centres[share_order]
+        fitted_anchors_per_type.append(fitted_anchors)
+        print_one_type(
+            type_name, type_endpoints.shape[0], fitted_anchors, fitted_counts[share_order],
+            endpoints_per_centre(initial_assignment, model.QUERY_COUNT),
+            iteration_count, stopped_by_convergence,
+        )
+
+    unit_anchors = torch.stack(fitted_anchors_per_type)
+    np.savez(output_path, unit_anchors=unit_anchors.numpy().astype(np.float32))
+    print(
+        f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)},"
+        f" one set per {contract.PREDICTED_OBJECT_TYPES} in that order, most-used anchor first"
     )
 
 

@@ -67,7 +67,7 @@ def measure(scenario_paths):
         ):
             now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
             lane_context = loader.lane_context_per_polyline(
-                scenario_array,
+                scenario_array["lane_graph"],
                 now_row[contract.AGENT_POSITION],
                 now_row[contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
             )

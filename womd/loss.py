@@ -1,20 +1,25 @@
-# > Training loss: one scored mode per anchor territory, in metres
+# > Training loss: one scored mode per anchor territory
 # The scored mode is the one whose ANCHOR endpoint sits nearest the logged endpoint, not the one
 # whose own prediction landed closest, so no mode can be starved of gradient by never happening to
 # win. The anchors are learned, so the assignment is read from their CURRENT value but detached: the
 # choice stays a hard non-differentiable one and an anchor moves through the regression term of the
-# mode it was assigned to, never by making itself easier to select. The distance itself is unchanged and still has zero free parameters -
-# mean Euclidean distance over valid steps, one mode, which is minADE's definition - so training
-# still optimises the quantity the leaderboard grades; the one knob is the classification weight
-# (§14 sweep, provisional 1.0).
+# mode it was assigned to, never by making itself easier to select. There is one anchor set per
+# predicted object type and the decoder is what selects a sample's; the assignment is handed that
+# same per-sample (batch, modes, 2) tensor rather than re-selecting from the table, so the mode the
+# loss scores and the mode the decoder aimed cannot come from different sets. The regression term is the
+# negative log-likelihood of the logged future under that mode's per-step axis-aligned Gaussians,
+# averaged over the valid steps: a mode reports how sure it is and pays for being sure and wrong,
+# which mean Euclidean distance cannot express. It is no longer in metres, so it is not the
+# leaderboard's quantity and metrics.py is what still watches that. The one knob is the
+# classification weight (§14 sweep, provisional 1.0).
 # The logged endpoint is the last VALID future position, never future_positions[:, -1]: a track can
 # stop early, and reading the padded tail would assign every early-ending sample to whichever anchor
 # sits nearest the origin.
 # The heading term is auxiliary and scores the SAME mode the position term does - letting it pick
 # its own winner would let the two terms pull toward different futures. It is the Euclidean
-# distance between the predicted heading cosine/sine pair and the logged one: the same form as the
-# position term so the two magnitudes are comparable, monotone in absolute angle error, and with no
-# angle anywhere there is no wraparound to handle and no free parameter to choose.
+# distance between the predicted heading cosine/sine pair and the logged one: monotone in absolute
+# angle error, and with no angle anywhere there is no wraparound to handle and no free parameter to
+# choose. Its weight is measured against the regression term rather than assumed comparable to it.
 # That monotonicity holds only for a prediction ON the unit circle, and the head's cosine/sine pair
 # is free to be any 2-vector, so the loss normalises it first. A shrunken pair beats a committed one
 # otherwise - the exact zero scores 1.0 against every logged heading while a unit vector a right
@@ -31,12 +36,18 @@
 # zero, and clamping the scoreable count the same way leaves a batch with nothing to score
 # returning the same zeros the early return used to.
 
+import math
+
 import torch
 
 MODE_CLASSIFICATION_WEIGHT = 1.0
+HALF_LOG_TWO_PI = 0.5 * math.log(2.0 * math.pi)
+PHYSICS_EXCESS_BUDGET_MULTIPLIER = 1.25
 
 
-def anchor_assigned_mode(unit_anchors, reachable_distance_metres, future_positions, future_mask):
+def anchor_assigned_mode(
+    selected_unit_anchors, reachable_distance_metres, future_positions, future_mask
+):
     validity = future_mask.to(future_positions.dtype)
     step_positions = torch.arange(
         future_mask.shape[-1], device=future_mask.device, dtype=future_positions.dtype
@@ -45,35 +56,50 @@ def anchor_assigned_mode(unit_anchors, reachable_distance_metres, future_positio
     logged_endpoint = future_positions.gather(
         1, last_valid_step[:, None, None].expand(-1, -1, 2)
     ).squeeze(1)
-    anchor_endpoints = unit_anchors.detach().unsqueeze(0) * reachable_distance_metres[:, None, None]
+    anchor_endpoints = selected_unit_anchors.detach() * reachable_distance_metres[:, None, None]
     return (anchor_endpoints - logged_endpoint.unsqueeze(1)).norm(dim=-1).argmin(dim=1)
 
 
-def prediction_loss(
-    trajectories, heading_cosine_sine, confidence_logits,
-    future_positions, future_headings, future_mask,
-    unit_anchors, reachable_distance_metres, heading_loss_weight,
+def gaussian_negative_log_likelihood(
+    trajectories, position_log_standard_deviation, future_positions
 ):
-    step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
+    standardised_error = (
+        trajectories - future_positions.unsqueeze(1)
+    ) / position_log_standard_deviation.exp()
+    return (
+        position_log_standard_deviation + 0.5 * standardised_error ** 2 + HALF_LOG_TWO_PI
+    ).sum(dim=-1)
+
+
+def prediction_loss(
+    trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+    future_positions, future_headings, future_mask,
+    selected_unit_anchors, reachable_distance_metres, heading_loss_weight,
+):
+    step_negative_log_likelihoods = gaussian_negative_log_likelihood(
+        trajectories, position_log_standard_deviation, future_positions
+    )
     unit_heading_cosine_sine = heading_cosine_sine / heading_cosine_sine.norm(
         dim=-1, keepdim=True
     ).clamp_min(torch.finfo(heading_cosine_sine.dtype).eps)
     step_heading_distances = (unit_heading_cosine_sine - future_headings.unsqueeze(1)).norm(dim=-1)
-    validity = future_mask.unsqueeze(1).to(step_distances.dtype)
+    validity = future_mask.unsqueeze(1).to(step_negative_log_likelihoods.dtype)
     valid_step_counts = validity.sum(dim=-1)
-    mode_mean_distance = (step_distances * validity).sum(dim=-1) / valid_step_counts.clamp_min(1.0)
+    mode_mean_negative_log_likelihood = (
+        (step_negative_log_likelihoods * validity).sum(dim=-1) / valid_step_counts.clamp_min(1.0)
+    )
     mode_mean_heading_distance = (
         (step_heading_distances * validity).sum(dim=-1) / valid_step_counts.clamp_min(1.0)
     )
 
-    scoreable = (valid_step_counts[:, 0] > 0).to(step_distances.dtype)
+    scoreable = (valid_step_counts[:, 0] > 0).to(step_negative_log_likelihoods.dtype)
     scoreable_count = scoreable.sum().clamp_min(1.0)
 
     assigned_mode = anchor_assigned_mode(
-        unit_anchors, reachable_distance_metres, future_positions, future_mask
+        selected_unit_anchors, reachable_distance_metres, future_positions, future_mask
     )
     regression = (
-        mode_mean_distance.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
+        mode_mean_negative_log_likelihood.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
     ).sum() / scoreable_count
     heading = (
         mode_mean_heading_distance.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
@@ -90,7 +116,19 @@ def prediction_loss(
     return total, regression, classification, heading
 
 
-def neighbour_future_loss(neighbour_future_positions, logged_positions, neighbour_future_mask):
+def physics_excess_loss(trajectories, reachable_distance_metres):
+    steps = torch.cat([trajectories[..., :1, :], trajectories.diff(dim=-2)], dim=-2)
+    path_lengths = steps.norm(dim=-1).sum(dim=-1)
+    allowed = PHYSICS_EXCESS_BUDGET_MULTIPLIER * reachable_distance_metres[:, None]
+    return (path_lengths - allowed).clamp_min(0.0).mean()
+
+
+def neighbour_future_loss(
+    neighbour_future_positions, logged_positions, neighbour_future_mask, neighbour_readable
+):
     step_distances = (neighbour_future_positions - logged_positions).norm(dim=-1)
-    validity = neighbour_future_mask.to(step_distances.dtype)
+    validity = (
+        neighbour_future_mask.to(step_distances.dtype)
+        * neighbour_readable.to(step_distances.dtype).unsqueeze(-1)
+    )
     return (step_distances * validity).sum() / validity.sum().clamp_min(1.0)

@@ -166,7 +166,7 @@ def time_build_sample_stages(timer, scenario_arrays, track_index):
     speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
     timer.start("lane_context_per_polyline")
     polyline_lane_context = loader.lane_context_per_polyline(
-        scenario_arrays,
+        scenario_arrays["lane_graph"],
         now_row[contract.AGENT_POSITION],
         now_row[contract.AGENT_HEADING_COSINE:contract.AGENT_HEADING_SINE + 1],
     )
@@ -195,21 +195,22 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
     with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
         timer.start("forward")
         (
-            trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
-            neighbour_future_positions,
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+            reachable_distance_metres, selected_unit_anchors, neighbour_future_positions,
         ) = predictor.predict_with_heading(batch)
         timer.stop("forward")
 
         timer.start("loss")
         total, _, _, _ = loss.prediction_loss(
-            trajectories, heading_cosine_sine, confidence_logits,
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            predictor.unit_anchors, reachable_distance_metres, 1.0
+            selected_unit_anchors, reachable_distance_metres, 1.0
         )
         total = total + loss.neighbour_future_loss(
             neighbour_future_positions,
             batch["neighbour_future_positions"],
             batch["neighbour_future_mask"],
+            batch["neighbour_history_mask"].any(dim=-1),
         )
         timer.stop("loss")
 
@@ -353,7 +354,7 @@ def main():
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    predictor = MotionPredictor(model.unit_anchor_offsets()).to(device)
+    predictor = MotionPredictor(model.unit_anchor_offsets_per_type()).to(device)
     optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
     gradient_scaler = train.GradScaler(
         enabled=arguments.mixed_precision and device.type == "cuda"

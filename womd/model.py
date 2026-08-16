@@ -13,7 +13,7 @@ HIDDEN_DIM = 128
 # column shares contract.DISTANCE_NORMALISER_METRES so geometry survives; a column with no
 # measured scale - heading cosine/sine, direction arrows, one-hots, the SDC flag - keeps a divisor
 # of 1 and passes through untouched. The signal history never reaches a divisor: it is one-hot and
-# it enters at the chunk token, past every per-dot and per-step encoder.
+# it enters at the agent, neighbour and chunk tokens, past every per-dot and per-step encoder.
 def agent_feature_divisors():
     divisors = torch.ones(contract.AGENT_FEATURE_DIM)
     divisors[contract.AGENT_POSITION] = contract.DISTANCE_NORMALISER_METRES
@@ -58,6 +58,9 @@ class MapDotEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.register_buffer("feature_divisors", map_feature_divisors())
+        self.register_buffer(
+            "crossing_code_rows", torch.eye(contract.NUM_BOUNDARY_CROSSING_CODES)
+        )
         input_width = (contract.MAP_FEATURE_DIM - 2) + 2 * contract.NUM_BOUNDARY_CROSSING_CODES
         self.network = nn.Sequential(
             nn.Linear(input_width, HIDDEN_DIM),
@@ -68,9 +71,7 @@ class MapDotEncoder(nn.Module):
     def forward(self, map_rows):
         scaled = map_rows / self.feature_divisors
         crossing_codes = map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:].long()
-        crossing_one_hot = nn.functional.one_hot(
-            crossing_codes, contract.NUM_BOUNDARY_CROSSING_CODES
-        ).flatten(start_dim=-2)
+        crossing_one_hot = self.crossing_code_rows[crossing_codes].flatten(start_dim=-2)
         return self.network(torch.cat(
             [scaled[:, :contract.MAP_LEFT_BOUNDARY_CROSSING], crossing_one_hot.to(scaled.dtype)],
             dim=-1,
@@ -171,8 +172,13 @@ class SceneEncoder(nn.Module):
         self.layers = nn.ModuleList(SceneAttentionLayer() for _ in range(SCENE_ATTENTION_ROUNDS))
 
     def forward(self, batch):
-        agent_token = self.agent_encoder(batch["agent_history"], batch["agent_history_mask"]).unsqueeze(1)
-        neighbour_tokens = self.neighbour_encoder(batch["neighbour_history"], batch["neighbour_history_mask"])
+        agent_token = (
+            self.agent_encoder(batch["agent_history"], batch["agent_history_mask"])
+            + self.signal_projection(batch["agent_signal_history"].flatten(start_dim=-2))
+        ).unsqueeze(1)
+        neighbour_tokens = self.neighbour_encoder(
+            batch["neighbour_history"], batch["neighbour_history_mask"]
+        ) + self.signal_projection(batch["neighbour_signal_history"].flatten(start_dim=-2))
         map_tokens, map_present = pool_dots_to_polyline_tokens(
             self.map_encoder(batch["map_rows"]), batch["map_dot_polyline_slot"],
             agent_token.shape[0], int(batch["max_polylines_in_batch"]),
@@ -199,6 +205,11 @@ ANCHOR_DIRECTION_COUNT = 6
 ANCHOR_DISTANCE_COUNT = 3
 assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
 TRAJECTORY_CONTROL_POINTS = 3
+POSITION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
+HEADING_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
+LOG_STANDARD_DEVIATION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
+MINIMUM_LOG_STANDARD_DEVIATION = -1.609
+MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
 
 
 def bernstein_curve_basis(control_point_count, step_count):
@@ -225,6 +236,15 @@ def unit_anchor_offsets():
     return fractions.unsqueeze(-1) * torch.stack([angles.cos(), angles.sin()], dim=-1)
 
 
+def unit_anchor_offsets_per_type():
+    return unit_anchor_offsets().repeat(contract.NUM_OBJECT_TYPES, 1, 1)
+
+
+def predicted_type_index(agent_history):
+    type_one_hot = agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE]
+    return type_one_hot[:, : contract.NUM_OBJECT_TYPES].argmax(dim=-1)
+
+
 # The furthest this agent could physically get inside the prediction horizon, one distance per
 # sample: its own logged speed at "now" carried for the whole horizon, plus what the project's
 # measured acceleration limit could add on top of that. Every term is the agent's own or measured
@@ -240,70 +260,42 @@ def agent_reachable_distance(agent_history):
     )
 
 
-# The head's whole curve is a FRACTION of the budget it is handed rather than a set of positions, so
-# a future the agent could not drive is unrepresentable instead of penalised - no loss term, no
-# weight, no number to choose. The budget is spent on the PATH the trajectory traces, not on how
-# far its endpoint lands: displacement never exceeds arc length, so bounding the path bounds the
-# endpoint too, while the endpoint form permits a mode to reach the 8 s radius at 2 s and come back
-# for free. The first step's contribution is measured from the origin because the agent sits there
-# at "now" by construction of the sample frame. The bound is the horizon's, applied to the whole
-# path, because the acceleration limit under it was measured at a 0.5 s window and §LIMITS rules
-# limit and window inseparable; re-evaluating it at one 0.1 s step reads the differentiation noise
-# that window exists to remove. Integrating a 0.5 s-window limit over 8 s errs conservative -
-# §LIMITS measures the limit FALLING as the window widens. Measured over 1,278 logged futures the
-# path form clips none of them, at a worst use of 0.894 of the budget against the endpoint form's
-# 0.712, so it constrains strictly harder while still never touching a real future. One scale
-# multiplies every position, so the trajectory's shape survives and only its size is bounded;
-# tanh(length) / length approaches 1 as the length goes to zero, so a short path sits in the linear
-# part of the map and costs no resolution, and flooring the divisor at the dtype's own eps keeps
-# the exactly zero path finite.
-# The squash reads the MEAN step, not the summed path, and the first form shipped without that
-# division was measured broken: a trajectory is contract.FUTURE_STEPS positions, so a path is
-# contract.FUTURE_STEPS terms of the size the endpoint form squashed one of, and tanh saturates. Measured on an untrained
-# model over ../data/staged, 2026-08-15: the endpoint form put 0.064 into tanh, the summed path put
-# 13.3, and tanh(13.3) is 1.000000 to every digit. A saturated squash is not a fence - it is an
-# instruction to spend the entire budget, and the 100-epoch run it shipped in did exactly that,
-# predicting 114 m of driving for a stopped car whose logged future walks 10 m, at a path/budget
-# ratio of 1.000 at every percentile. Dividing by the step count is not a chosen constant; it is the
-# count the sum ran over, and it returns tanh's input to the scale the endpoint form worked at.
-def fence_to_path_length_budget(raw_position, path_length_budget_metres):
-    steps = torch.cat([raw_position[..., :1, :], raw_position.diff(dim=-2)], dim=-2)
-    path_length = steps.norm(dim=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
-    mean_step_length = path_length / contract.FUTURE_STEPS
-    fenced_length = torch.tanh(mean_step_length) * path_length_budget_metres
-    return raw_position * fenced_length / path_length.clamp_min(torch.finfo(raw_position.dtype).eps)
-
-
-# QUERY_COUNT learned queries, each a standing question the model owns, and each owning one anchor -
-# the territory it is assigned logged futures from, starting at the anchor set the constructor is
-# handed and free to move. There is no default: which futures each mode is assigned is a modelling
+# QUERY_COUNT learned queries, each a standing question the model owns, and each owning one anchor
+# PER PREDICTED OBJECT TYPE - the territory it is assigned logged futures from, starting at the
+# contract.NUM_OBJECT_TYPES anchor sets the constructor is handed and free to move. A walking
+# pedestrian's plausible futures look nothing like a car's and a cyclist's are a third thing, so
+# each type is fitted its own set and a sample is handed its own type's, selected from the type
+# one-hot on its "now" row. There is no default: which futures each mode is assigned is a modelling
 # claim, so a caller states where its anchors come from rather than inheriting one from this file.
-# The anchor is added to the query so the mode knows which territory it holds, and again to the
-# curve, ramped over the horizon so it arrives in full at the endpoint and leaves the origin start
-# untouched, so the anchor sits in the output and is pulled by the regression term of the
+# The selected anchor is added to the query so the mode knows which territory it holds, and again to
+# the curve, ramped over the horizon so it arrives in full at the endpoint and leaves the origin
+# start untouched, so the anchor sits in the output and is pulled by the regression term of the
 # mode it was assigned to. That second addition is in METRES, at unit_anchor * reachable_distance -
 # the endpoint loss.anchor_assigned_mode assigns logged futures by and the one
 # baseline.straight_lines_to_most_used_anchors drives to - so one definition of an anchor holds in
-# all four places. Adding it in budget-fraction space before the fence did not: the fence rescales by
-# tanh(path / FUTURE_STEPS) * reachable / path, so a fraction-space anchor reached the endpoint
-# divided by FUTURE_STEPS, 0.629 m against the loss's 50.343 m for the same anchor.
-# The anchor's own straight ramp costs |unit_anchor| * reachable of the path budget, so the curve is
-# fenced to what is LEFT and the two sum to at most the budget: every step is an anchor step plus a
-# curve step, and the triangle inequality bounds the path by |unit_anchor| * reachable plus
-# (1 - |unit_anchor|) * reachable. The split needs the anchor to name a destination inside the
-# reachable set, which is what the unit_anchors projection guarantees - a fraction beyond 1 claims
-# the agent can outrun its own acceleration limit - and the projection is the identity on anchors
-# k-means fits, since it fits them on endpoints the same budget already bounds.
+# all four places. forward RETURNS the per-sample selected anchors and the loss is handed that same
+# tensor rather than re-selecting, so the decoder and the assignment cannot disagree about which set
+# a sample got. The unit_anchors projection keeps every anchor inside the reachable disc, so the
+# destination a mode is handed is one the agent's own acceleration limit admits, and the projection
+# is the identity on anchors k-means fits.
 # Each query cross-attends over the scene tokens and a
 # SHARED head writes its trajectory + confidence - modes differ by their query vector and by their
 # anchor, so query count is a config number. The head writes TRAJECTORY_CONTROL_POINTS position
-# pairs, which the Bernstein basis evaluates into the contract.FUTURE_STEPS positions, and then the
-# heading as a cosine/sine PAIR per future step rather than an angle, so nothing
-# downstream has to wrap. Only the position half passes through the fence - a cosine/sine pair is
-# unit-scale already and loss.py normalises it to the unit circle before scoring it.
+# pairs, TRAJECTORY_CONTROL_POINTS heading pairs and TRAJECTORY_CONTROL_POINTS log-standard-deviation
+# pairs, which the same Bernstein basis evaluates into the contract.FUTURE_STEPS positions in metres,
+# the contract.FUTURE_STEPS heading cosine/sine pairs - a pair per step rather than an angle, so
+# nothing downstream has to wrap - and the contract.FUTURE_STEPS per-axis log standard deviations the
+# regression term reads. Nothing rescales or squashes a predicted coordinate; the one clamp is on the
+# log standard deviation, at MTR's shipped range.
 class ModeDecoder(nn.Module):
     def __init__(self, initial_unit_anchors):
         super().__init__()
+        assert initial_unit_anchors.shape == (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2), (
+            f"initial_unit_anchors has shape {tuple(initial_unit_anchors.shape)}, but the decoder"
+            f" holds one {QUERY_COUNT}-anchor set per predicted object type and needs"
+            f" ({contract.NUM_OBJECT_TYPES}, {QUERY_COUNT}, 2)."
+            f" Re-run fit_anchors.py to produce a per-type anchor file"
+        )
         self.queries = nn.Parameter(torch.randn(QUERY_COUNT, HIDDEN_DIM) * 0.02)
         self.anchor_offsets = nn.Parameter(initial_unit_anchors.detach().clone())
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
@@ -314,7 +306,9 @@ class ModeDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(
                 FEEDFORWARD_DIM,
-                2 * (TRAJECTORY_CONTROL_POINTS + contract.FUTURE_STEPS),
+                POSITION_CONTROL_VALUES
+                + HEADING_CONTROL_VALUES
+                + LOG_STANDARD_DEVIATION_CONTROL_VALUES,
             ),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
@@ -334,31 +328,35 @@ class ModeDecoder(nn.Module):
     def unit_anchors(self):
         return self.anchor_offsets / self.anchor_offsets.norm(dim=-1, keepdim=True).clamp_min(1.0)
 
-    def forward(self, tokens, token_present, reachable_distance_metres):
+    def forward(self, tokens, token_present, reachable_distance_metres, predicted_type_index):
         batch_size = tokens.shape[0]
-        unit_anchors = self.unit_anchors
-        anchored_queries = self.queries + self.anchor_projection(unit_anchors)
-        queries = anchored_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        selected_unit_anchors = self.unit_anchors[predicted_type_index]
+        queries = self.queries + self.anchor_projection(selected_unit_anchors)
         read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
         head_output = self.trajectory_head(read)
-        control_points = head_output[..., : 2 * TRAJECTORY_CONTROL_POINTS].view(
+        control_points = head_output[..., :POSITION_CONTROL_VALUES].view(
             batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2
         )
-        heading_cosine_sine = head_output[..., 2 * TRAJECTORY_CONTROL_POINTS:].view(
-            batch_size, QUERY_COUNT, contract.FUTURE_STEPS, 2
-        )
+        heading_control_points = head_output[
+            ..., POSITION_CONTROL_VALUES:POSITION_CONTROL_VALUES + HEADING_CONTROL_VALUES
+        ].view(batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2)
+        log_standard_deviation_control_points = head_output[
+            ..., POSITION_CONTROL_VALUES + HEADING_CONTROL_VALUES:
+        ].view(batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2)
+        heading_cosine_sine = torch.matmul(self.curve_basis, heading_control_points)
+        position_log_standard_deviation = torch.matmul(
+            self.curve_basis, log_standard_deviation_control_points
+        ).clamp(MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION)
         confidence_logits = self.confidence_head(read).squeeze(-1)
-        anchor_endpoints = unit_anchors[None, :, :] * reachable_distance_metres[:, None, None]
-        curve_budget_metres = (
-            reachable_distance_metres[:, None] - anchor_endpoints.norm(dim=-1)
-        ).clamp_min(0.0)[:, :, None, None]
+        anchor_endpoints = selected_unit_anchors * reachable_distance_metres[:, None, None]
         anchored_position = (
-            fence_to_path_length_budget(
-                torch.matmul(self.curve_basis, control_points), curve_budget_metres
-            )
+            torch.matmul(self.curve_basis, control_points)
             + anchor_endpoints[:, :, None, :] * self.anchor_ramp[None, None, :, None]
         )
-        return anchored_position, heading_cosine_sine, confidence_logits
+        return (
+            anchored_position, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, selected_unit_anchors,
+        )
 
 
 # Confidence-ordered endpoint pruning (MTR's reduction): walk modes by descending confidence,
@@ -482,20 +480,27 @@ class MotionPredictor(nn.Module):
     def encode_scene_and_modes(self, batch):
         tokens, token_present = self.scene_encoder(batch)
         reachable_distance_metres = agent_reachable_distance(batch["agent_history"])
-        trajectories, heading_cosine_sine, confidence_logits = self.mode_decoder(
-            tokens, token_present, reachable_distance_metres
+        (
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+            selected_unit_anchors,
+        ) = self.mode_decoder(
+            tokens, token_present, reachable_distance_metres,
+            predicted_type_index(batch["agent_history"]),
         )
-        return tokens, trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+        return (tokens, trajectories, heading_cosine_sine, position_log_standard_deviation,
+                confidence_logits, reachable_distance_metres, selected_unit_anchors)
 
     def predict_with_heading(self, batch):
         (
-            tokens, trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+            tokens, trajectories, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, reachable_distance_metres, selected_unit_anchors,
         ) = self.encode_scene_and_modes(batch)
         neighbour_count = batch["neighbour_history"].shape[1]
         neighbour_future_positions = self.neighbour_future_head(tokens[:, 1:1 + neighbour_count])
-        return (trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+        return (trajectories, heading_cosine_sine, position_log_standard_deviation,
+                confidence_logits, reachable_distance_metres, selected_unit_anchors,
                 neighbour_future_positions)
 
     def forward(self, batch):
-        _, trajectories, _, confidence_logits, _ = self.encode_scene_and_modes(batch)
+        _, trajectories, _, _, confidence_logits, _, _ = self.encode_scene_and_modes(batch)
         return trajectories, confidence_logits

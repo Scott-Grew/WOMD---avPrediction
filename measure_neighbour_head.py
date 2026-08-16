@@ -39,20 +39,24 @@ def read_batches(scenario_paths, batch_size, batch_count):
 def equal_footing_weight(predictor, batch):
     with torch.no_grad():
         (
-            trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
-            neighbour_future_positions,
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+            reachable_distance_metres, selected_unit_anchors, neighbour_future_positions,
         ) = predictor.predict_with_heading(batch)
-        _, regression, _, _ = loss.prediction_loss(
-            trajectories, heading_cosine_sine, confidence_logits,
+        _, regression, _, heading = loss.prediction_loss(
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            predictor.unit_anchors, reachable_distance_metres, 1.0,
+            selected_unit_anchors, reachable_distance_metres, 1.0,
         )
         neighbour_future = loss.neighbour_future_loss(
             neighbour_future_positions,
             batch["neighbour_future_positions"],
             batch["neighbour_future_mask"],
+            batch["neighbour_history_mask"].any(dim=-1),
         )
-    return float(regression), float(neighbour_future), float(regression / neighbour_future)
+    return (
+        float(regression), float(neighbour_future),
+        float(regression / neighbour_future), float(regression / heading),
+    )
 
 
 def step_seconds(predictor, batch, with_neighbour_head, repeats):
@@ -61,23 +65,26 @@ def step_seconds(predictor, batch, with_neighbour_head, repeats):
         start = time.perf_counter()
         if with_neighbour_head:
             (
-                trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres,
+                trajectories, heading_cosine_sine, position_log_standard_deviation,
+                confidence_logits, reachable_distance_metres, selected_unit_anchors,
                 neighbour_future_positions,
             ) = predictor.predict_with_heading(batch)
         else:
             (
-                _, trajectories, heading_cosine_sine, confidence_logits, reachable_distance_metres
+                _, trajectories, heading_cosine_sine, position_log_standard_deviation,
+                confidence_logits, reachable_distance_metres, selected_unit_anchors,
             ) = predictor.encode_scene_and_modes(batch)
         total, _, _, _ = loss.prediction_loss(
-            trajectories, heading_cosine_sine, confidence_logits,
+            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            predictor.unit_anchors, reachable_distance_metres, 1.0,
+            selected_unit_anchors, reachable_distance_metres, 1.0,
         )
         if with_neighbour_head:
             total = total + loss.neighbour_future_loss(
                 neighbour_future_positions,
                 batch["neighbour_future_positions"],
                 batch["neighbour_future_mask"],
+                batch["neighbour_history_mask"].any(dim=-1),
             )
         predictor.zero_grad()
         total.backward()
@@ -99,7 +106,7 @@ def main():
     torch.manual_seed(arguments.seed)
     with np.load(arguments.anchors) as anchors_file:
         initial_unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
-    assert initial_unit_anchors.shape == (QUERY_COUNT, 2)
+    assert initial_unit_anchors.shape == (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2)
     predictor = MotionPredictor(initial_unit_anchors)
 
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))[: arguments.scenarios]
@@ -110,13 +117,18 @@ def main():
     for batch_size in arguments.batch_sizes:
         batches, neighbour_counts = read_batches(scenario_paths, batch_size, arguments.batches)
         ratios = [equal_footing_weight(predictor, batch) for batch in batches]
-        all_ratios.extend(ratio for _, _, ratio in ratios)
+        all_ratios.extend(ratio for _, _, ratio, _ in ratios)
+        heading_ratios = [heading_ratio for _, _, _, heading_ratio in ratios]
         print(
             f"batch size {batch_size}, {len(batches)} batches |"
-            f" regression {np.mean([value for value, _, _ in ratios]):.3f} m |"
-            f" neighbour future {np.mean([value for _, value, _ in ratios]):.3f} m |"
+            f" regression {np.mean([value for value, _, _, _ in ratios]):.3f} nats |"
+            f" neighbour future {np.mean([value for _, value, _, _ in ratios]):.3f} m |"
             f" equal-footing weight per batch "
-            + " ".join(f"{ratio:.3f}" for _, _, ratio in ratios)
+            + " ".join(f"{ratio:.3f}" for _, _, ratio, _ in ratios)
+        )
+        print(
+            f"  equal-footing HEADING weight mean {np.mean(heading_ratios):.3f},"
+            f" per batch " + " ".join(f"{ratio:.3f}" for ratio in heading_ratios)
         )
         print(
             f"  neighbours per sample over {len(neighbour_counts)} samples:"

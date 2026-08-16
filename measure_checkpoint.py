@@ -1,15 +1,18 @@
 # > Checkpoint measurement: the comparable read on a trained model, so two runs can be set beside
 # each other without a throwaway script in between. Reports the three numbers that separate what the
 # model KNOWS from what it SUBMITS - the best of all its modes, the best of the six the confidence
-# head chooses, and the best of six drawn at random - plus how far apart the modes spread and how
-# much of each agent's own reachable budget the predictions spend.
+# head chooses, and the best of six drawn at random - plus two diagnostics over an output nothing
+# bounds: how far apart the modes spread, and how far the longest of them drives against the agent's
+# own reachable distance. The second is a ratio to be read beside measure_fence.py's reading of the
+# same ratio over the logged futures; no value of it is a failure by itself.
 # The random draw is the control the confidence number is read against: a confidence head that
 # cannot beat it has learned nothing about which mode to trust, whatever the loss curve says.
 # Four nulls are the controls the MODEL is read against, on the same samples through the same path.
 # Constant velocity carries the logged velocity for the whole horizon and CTRV carries the logged
 # yaw rate with it: a model that cannot beat those has learned nothing about the agent's own motion.
-# The anchor null drives the six most-used fitted anchors in a straight line with the scene unread: a
-# model that cannot beat it has learned nothing the anchors did not already carry. The lane null
+# The anchor null drives the six most-used anchors fitted for the agent's OWN OBJECT TYPE in a
+# straight line with the scene unread: a model that cannot beat it has learned nothing the anchors
+# did not already carry. The lane null
 # drives the lane the agent is already in, at the speed it is already going, out to six routes
 # through the lane graph's forks: a model that cannot beat it has learned nothing from the map,
 # the lane graph, the traffic lights or the neighbours it is handed.
@@ -98,7 +101,7 @@ def main():
     generator = torch.Generator().manual_seed(RANDOM_DRAW_SEED)
 
     best_distances = {}
-    widest_gap, budget_use = [], []
+    widest_gap, reachable_distance_use = [], []
     sample_count = 0
     lane_fallback_count = 0
     for batch, lane_null_trajectories, followed_a_lane in batches_with_lane_null(
@@ -146,7 +149,7 @@ def main():
             [scored_trajectories[..., :1, :], scored_trajectories.diff(dim=-2)], dim=-2
         )
         widest_gap.append(torch.cdist(endpoints, endpoints).amax(dim=(1, 2)))
-        budget_use.append(steps.norm(dim=-1).sum(dim=-1).amax(dim=1) / reachable)
+        reachable_distance_use.append(steps.norm(dim=-1).sum(dim=-1).amax(dim=1) / reachable)
         sample_count += int(scoreable.sum())
         lane_fallback_count += int((~followed_a_lane[scoreable]).sum())
 
@@ -157,7 +160,8 @@ def main():
     rows.extend(
         (name, "", torch.cat(values).numpy())
         for name, values in (
-            ("widest gap between modes", widest_gap), ("path / reachable budget", budget_use),
+            ("widest gap between modes", widest_gap),
+            ("path / reachable distance", reachable_distance_use),
         )
     )
     print(f"{checkpoint_path} on {staged_directory}, anchors {fitted_anchors_path}")

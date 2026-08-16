@@ -6,7 +6,8 @@
 # graph: the loader compresses the graph to per-chunk reachability and graph distance, which cannot
 # tell one route through a fork from another. None has a free parameter: constant velocity assumes
 # the logged velocity persists, CTRV assumes the logged yaw rate persists with it, the anchor null
-# drives straight to the destinations logged futures actually reach, the lane-following null drives
+# drives straight to the destinations logged futures of the agent's OWN TYPE actually reach, the
+# lane-following null drives
 # the lane the agent is already in at the speed it is already going, and there is nothing in any of
 # them to tune toward a flattering number.
 
@@ -136,8 +137,8 @@ def nearest_lane_dot(map_rows, lane_dot_indices, agent_position, agent_heading_c
         lane_dot_rows[:, contract.MAP_POSITION] - agent_position, axis=1
     )
     return int(lane_dot_indices[loader.nearest_lane_dot_facing_the_agent_way(
-        lane_dot_rows, agent_distances, agent_heading_cosine_sine
-    )])
+        lane_dot_rows, agent_distances[None], agent_heading_cosine_sine[None]
+    )[0]])
 
 
 def exit_lanes_in_connection_order(lane_connections):
@@ -258,10 +259,11 @@ def follow_the_lane_predictions(scenario_array, track_index):
 
 def straight_lines_to_most_used_anchors(batch, unit_anchors):
     reachable_distance_metres = model.agent_reachable_distance(batch["agent_history"])
-    most_used_anchors = unit_anchors[: contract.NUM_PREDICTED_MODES].to(
-        reachable_distance_metres.dtype
-    )
-    endpoints = reachable_distance_metres[:, None, None] * most_used_anchors[None]
+    predicted_type_index = model.predicted_type_index(batch["agent_history"])
+    most_used_anchors = unit_anchors[predicted_type_index][
+        :, : contract.NUM_PREDICTED_MODES
+    ].to(reachable_distance_metres.dtype)
+    endpoints = reachable_distance_metres[:, None, None] * most_used_anchors
     elapsed_seconds = future_elapsed_seconds(endpoints.device, endpoints.dtype)
     trajectories = (
         endpoints[:, :, None, :]
