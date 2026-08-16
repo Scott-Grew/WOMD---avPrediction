@@ -40,7 +40,6 @@ import math
 
 import torch
 
-MODE_CLASSIFICATION_WEIGHT = 1.0
 HALF_LOG_TWO_PI = 0.5 * math.log(2.0 * math.pi)
 
 
@@ -74,6 +73,7 @@ def prediction_loss(
     trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
     future_positions, future_headings, future_mask,
     selected_unit_anchors, reachable_distance_metres, heading_loss_weight,
+    classification_loss_weight,
 ):
     step_negative_log_likelihoods = gaussian_negative_log_likelihood(
         trajectories, position_log_standard_deviation, future_positions
@@ -114,7 +114,7 @@ def prediction_loss(
     ).sum() / scoreable_count
     total = (
         regression
-        + MODE_CLASSIFICATION_WEIGHT * classification
+        + classification_loss_weight * classification
         + heading_loss_weight * heading
     )
     return total, regression, classification, heading

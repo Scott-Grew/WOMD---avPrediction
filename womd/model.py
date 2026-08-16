@@ -275,9 +275,9 @@ def agent_reachable_distance(agent_history):
 # baseline.straight_lines_to_most_used_anchors drives to - so one definition of an anchor holds in
 # all four places. forward RETURNS the per-sample selected anchors and the loss is handed that same
 # tensor rather than re-selecting, so the decoder and the assignment cannot disagree about which set
-# a sample got. The unit_anchors projection keeps every anchor inside the reachable disc, so the
-# destination a mode is handed is one the agent's own acceleration limit admits, and the projection
-# is the identity on anchors k-means fits.
+# a sample got. The anchors are read raw - no projection, no clamp: the field bounds no output
+# coordinate, and the fit excludes physically impossible endpoints, so the table holds only
+# destinations real agents reached.
 # Each query cross-attends over the scene tokens and a
 # SHARED head writes its trajectory + confidence - modes differ by their query vector and by their
 # anchor, so query count is a config number. The head writes TRAJECTORY_CONTROL_POINTS position
@@ -461,7 +461,7 @@ class NeighbourFutureHead(nn.Module):
         return positions.view(*neighbour_tokens.shape[:2], contract.FUTURE_STEPS, 2)
 
 
-# Training reads all 64 modes; prune_modes runs only at evaluation/submission. forward keeps the
+# Training reads all QUERY_COUNT modes; prune_modes runs only at evaluation/submission. forward keeps the
 # (trajectories in metres, confidence logits) pair the metric accumulator, the null baselines and
 # the submission path all speak, and pays for nothing else; the auxiliary heading and the neighbour
 # futures are training-only outputs and are reached through predict_with_heading, which the epoch

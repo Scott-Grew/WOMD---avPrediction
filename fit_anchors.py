@@ -54,10 +54,19 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
     empty_centres = (counts == 0.0).nonzero(as_tuple=True)[0]
     if empty_centres.numel() == 0:
         return centres
-    own_centre_distances = (endpoints - centres[assignment]).norm(dim=-1)
-    furthest = torch.argsort(own_centre_distances, descending=True, stable=True)
     reseeded = centres.clone()
-    reseeded[empty_centres] = endpoints[furthest[: empty_centres.numel()]]
+    splits_taken_from = torch.zeros_like(counts, dtype=torch.long)
+    for empty_centre in empty_centres.tolist():
+        busiest_centre = int((counts / (1.0 + splits_taken_from)).argmax())
+        endpoints_of_busiest = endpoints[assignment == busiest_centre]
+        spread_within_busiest = (
+            endpoints_of_busiest - centres[busiest_centre]
+        ).norm(dim=-1)
+        spread_order = torch.argsort(spread_within_busiest, descending=True, stable=True)
+        reseeded[empty_centre] = endpoints_of_busiest[
+            spread_order[int(splits_taken_from[busiest_centre])]
+        ]
+        splits_taken_from[busiest_centre] += 1
     return reseeded
 
 
@@ -119,7 +128,7 @@ def print_one_type(
 def main():
     staged_directory = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
-    endpoints_cache_path = staged_directory / "fitted_endpoints_cache.npz"
+    endpoints_cache_path = staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
 
     start_seconds = time.perf_counter()
     if endpoints_cache_path.exists():
@@ -138,6 +147,15 @@ def main():
         print(f"endpoints cached to {endpoints_cache_path}")
     elapsed_seconds = time.perf_counter() - start_seconds
 
+    physically_reachable = endpoints.norm(dim=-1) <= 1.0
+    excluded_count = int((~physically_reachable).sum())
+    endpoints = endpoints[physically_reachable]
+    predicted_type_index = predicted_type_index[physically_reachable]
+    print(
+        f"{excluded_count} endpoints past their own reachable budget excluded from the fit;"
+        f" they remain training samples and assign to their nearest fitted anchor"
+    )
+
     type_sample_counts = [
         int((predicted_type_index == type_index).sum())
         for type_index in range(contract.NUM_OBJECT_TYPES)
@@ -155,10 +173,7 @@ def main():
         f" {staged_directory}"
     )
 
-    print(
-        f"scenarios {len(scenario_paths)} | samples {endpoints.shape[0]}"
-        f" | {elapsed_seconds:.1f} s"
-    )
+    print(f"samples {endpoints.shape[0]} | {elapsed_seconds:.1f} s")
     print(
         "samples per type | "
         + " ".join(

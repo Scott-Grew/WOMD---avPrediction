@@ -788,7 +788,7 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
-        selected_unit_anchors, reachable_distance_metres, 1.0,
+        selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
     )
     neighbour_future = loss.neighbour_future_loss(
         neighbour_future_positions,
@@ -1080,7 +1080,7 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
             trajectories, heading_cosine_sine,
             torch.full_like(trajectories, log_standard_deviation), confidence_logits,
             future_positions, future_headings, future_mask,
-            unit_anchors, reachable_distance_metres, 1.0,
+            unit_anchors, reachable_distance_metres, 1.0, 1.0,
         )
         return float(regression)
 

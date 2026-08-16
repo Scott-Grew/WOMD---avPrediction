@@ -97,7 +97,7 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
 
 def train_epoch(
     predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
-    neighbour_future_loss_weight, checkpoint_path, previous_checkpoint_path,
+    classification_loss_weight, neighbour_future_loss_weight, checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
     completed_steps_before_epoch, total_optimiser_steps,
 ):
@@ -133,6 +133,7 @@ def train_epoch(
                 confidence_logits,
                 batch["future_positions"], batch["future_headings"], batch["future_mask"],
                 selected_unit_anchors, reachable_distance_metres, heading_loss_weight,
+                classification_loss_weight,
             )
             neighbour_future = loss.neighbour_future_loss(
                 neighbour_future_positions,
@@ -247,6 +248,7 @@ def main():
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--heading-loss-weight", type=float, required=True)
+    parser.add_argument("--classification-loss-weight", type=float, required=True)
     parser.add_argument("--neighbour-future-loss-weight", type=float, required=True)
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
@@ -332,7 +334,7 @@ def main():
         )
         averages, monitor, seconds = train_epoch(
             predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
-            arguments.neighbour_future_loss_weight,
+            arguments.classification_loss_weight, arguments.neighbour_future_loss_weight,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             epoch_index * steps_per_epoch, total_optimiser_steps,

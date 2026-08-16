@@ -204,7 +204,7 @@ def run_device_iteration(timer, predictor, optimizer, gradient_scaler, accumulat
         total, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, reachable_distance_metres, 1.0
+            selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
         )
         total = total + loss.neighbour_future_loss(
             neighbour_future_positions,

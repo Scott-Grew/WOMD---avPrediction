@@ -42,10 +42,10 @@ def equal_footing_weight(predictor, batch):
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             reachable_distance_metres, selected_unit_anchors, neighbour_future_positions,
         ) = predictor.predict_with_heading(batch)
-        _, regression, _, heading = loss.prediction_loss(
+        _, regression, classification, heading = loss.prediction_loss(
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, reachable_distance_metres, 1.0,
+            selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
         )
         neighbour_future = loss.neighbour_future_loss(
             neighbour_future_positions,
@@ -56,6 +56,7 @@ def equal_footing_weight(predictor, batch):
     return (
         float(regression), float(neighbour_future),
         float(regression / neighbour_future), float(regression / heading),
+        float(regression / classification),
     )
 
 
@@ -77,7 +78,7 @@ def step_seconds(predictor, batch, with_neighbour_head, repeats):
         total, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, reachable_distance_metres, 1.0,
+            selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
         )
         if with_neighbour_head:
             total = total + loss.neighbour_future_loss(
@@ -117,18 +118,23 @@ def main():
     for batch_size in arguments.batch_sizes:
         batches, neighbour_counts = read_batches(scenario_paths, batch_size, arguments.batches)
         ratios = [equal_footing_weight(predictor, batch) for batch in batches]
-        all_ratios.extend(ratio for _, _, ratio, _ in ratios)
-        heading_ratios = [heading_ratio for _, _, _, heading_ratio in ratios]
+        all_ratios.extend(ratio for _, _, ratio, _, _ in ratios)
+        heading_ratios = [heading_ratio for _, _, _, heading_ratio, _ in ratios]
+        classification_ratios = [ratio for _, _, _, _, ratio in ratios]
         print(
             f"batch size {batch_size}, {len(batches)} batches |"
-            f" regression {np.mean([value for value, _, _, _ in ratios]):.3f} nats |"
-            f" neighbour future {np.mean([value for _, value, _, _ in ratios]):.3f} m |"
+            f" regression {np.mean([value for value, _, _, _, _ in ratios]):.3f} nats |"
+            f" neighbour future {np.mean([value for _, value, _, _, _ in ratios]):.3f} m |"
             f" equal-footing weight per batch "
-            + " ".join(f"{ratio:.3f}" for _, _, ratio, _ in ratios)
+            + " ".join(f"{ratio:.3f}" for _, _, ratio, _, _ in ratios)
         )
         print(
             f"  equal-footing HEADING weight mean {np.mean(heading_ratios):.3f},"
             f" per batch " + " ".join(f"{ratio:.3f}" for ratio in heading_ratios)
+        )
+        print(
+            f"  equal-footing CLASSIFICATION weight mean {np.mean(classification_ratios):.3f},"
+            f" per batch " + " ".join(f"{ratio:.3f}" for ratio in classification_ratios)
         )
         print(
             f"  neighbours per sample over {len(neighbour_counts)} samples:"
