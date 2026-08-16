@@ -42,7 +42,6 @@ import torch
 
 MODE_CLASSIFICATION_WEIGHT = 1.0
 HALF_LOG_TWO_PI = 0.5 * math.log(2.0 * math.pi)
-PHYSICS_EXCESS_BUDGET_MULTIPLIER = 1.25
 
 
 def anchor_assigned_mode(
@@ -104,8 +103,13 @@ def prediction_loss(
     heading = (
         mode_mean_heading_distance.gather(1, assigned_mode[:, None]).squeeze(1) * scoreable
     ).sum() / scoreable_count
+    assigned_mode_one_hot = torch.nn.functional.one_hot(
+        assigned_mode, confidence_logits.shape[1]
+    ).to(confidence_logits.dtype)
     classification = (
-        torch.nn.functional.cross_entropy(confidence_logits, assigned_mode, reduction="none")
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            confidence_logits, assigned_mode_one_hot, reduction="none"
+        ).sum(dim=1)
         * scoreable
     ).sum() / scoreable_count
     total = (
@@ -114,13 +118,6 @@ def prediction_loss(
         + heading_loss_weight * heading
     )
     return total, regression, classification, heading
-
-
-def physics_excess_loss(trajectories, reachable_distance_metres):
-    steps = torch.cat([trajectories[..., :1, :], trajectories.diff(dim=-2)], dim=-2)
-    path_lengths = steps.norm(dim=-1).sum(dim=-1)
-    allowed = PHYSICS_EXCESS_BUDGET_MULTIPLIER * reachable_distance_metres[:, None]
-    return (path_lengths - allowed).clamp_min(0.0).mean()
 
 
 def neighbour_future_loss(

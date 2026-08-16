@@ -326,7 +326,7 @@ class ModeDecoder(nn.Module):
 
     @property
     def unit_anchors(self):
-        return self.anchor_offsets / self.anchor_offsets.norm(dim=-1, keepdim=True).clamp_min(1.0)
+        return self.anchor_offsets
 
     def forward(self, tokens, token_present, reachable_distance_metres, predicted_type_index):
         batch_size = tokens.shape[0]

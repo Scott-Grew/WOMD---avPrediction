@@ -8,7 +8,7 @@ import torch
 
 from womd import contract, loader, model
 
-MAXIMUM_ITERATIONS = 100
+MAXIMUM_ITERATIONS = 2000
 
 
 def budget_fraction_endpoints(scenario_paths):
@@ -119,10 +119,23 @@ def print_one_type(
 def main():
     staged_directory = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
-    scenario_paths = sorted(staged_directory.glob("*.npz"))
+    endpoints_cache_path = staged_directory / "fitted_endpoints_cache.npz"
 
     start_seconds = time.perf_counter()
-    endpoints, predicted_type_index = budget_fraction_endpoints(scenario_paths)
+    if endpoints_cache_path.exists():
+        with np.load(endpoints_cache_path) as endpoints_cache:
+            endpoints = torch.from_numpy(endpoints_cache["endpoints"])
+            predicted_type_index = torch.from_numpy(endpoints_cache["predicted_type_index"])
+        print(f"endpoints read from {endpoints_cache_path}")
+    else:
+        scenario_paths = sorted(staged_directory.glob("*.npz"))
+        endpoints, predicted_type_index = budget_fraction_endpoints(scenario_paths)
+        np.savez(
+            endpoints_cache_path,
+            endpoints=endpoints.numpy().astype(np.float32),
+            predicted_type_index=predicted_type_index.numpy().astype(np.int64),
+        )
+        print(f"endpoints cached to {endpoints_cache_path}")
     elapsed_seconds = time.perf_counter() - start_seconds
 
     type_sample_counts = [
@@ -138,7 +151,7 @@ def main():
     ]
     assert not starved_types, (
         f"{model.QUERY_COUNT} anchors per type need at least {model.QUERY_COUNT} endpoints per"
-        f" type, but " + ", ".join(starved_types) + f" over {len(scenario_paths)} scenarios of"
+        f" type, but " + ", ".join(starved_types) + f" over {len(endpoints)} endpoints of"
         f" {staged_directory}"
     )
 

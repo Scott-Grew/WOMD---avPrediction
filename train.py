@@ -97,7 +97,7 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
 
 def train_epoch(
     predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
-    neighbour_future_loss_weight, physics_loss_weight, checkpoint_path, previous_checkpoint_path,
+    neighbour_future_loss_weight, checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
     completed_steps_before_epoch, total_optimiser_steps,
 ):
@@ -105,7 +105,7 @@ def train_epoch(
     window_accumulator = metrics.MetricAccumulator()
     loss_sums = {
         "total": 0.0, "regression": 0.0, "classification": 0.0,
-        "heading": 0.0, "neighbour_future": 0.0, "physics_excess": 0.0,
+        "heading": 0.0, "neighbour_future": 0.0,
     }
     window_loss_sums = dict.fromkeys(loss_sums, 0.0)
     seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
@@ -140,12 +140,7 @@ def train_epoch(
                 batch["neighbour_future_mask"],
                 batch["neighbour_history_mask"].any(dim=-1),
             )
-            physics_excess = loss.physics_excess_loss(trajectories, reachable_distance_metres)
-            total = (
-                total
-                + neighbour_future_loss_weight * neighbour_future
-                + physics_loss_weight * physics_excess
-            )
+            total = total + neighbour_future_loss_weight * neighbour_future
         learning_rate = cosine_learning_rate(
             completed_steps_before_epoch + batch_count, total_optimiser_steps
         )
@@ -163,7 +158,6 @@ def train_epoch(
             "classification": float(classification.detach()),
             "heading": float(heading.detach()),
             "neighbour_future": float(neighbour_future.detach()),
-            "physics_excess": float(physics_excess.detach()),
         }
         for name, value in component_values.items():
             loss_sums[name] += value
@@ -212,7 +206,7 @@ def train_epoch(
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / max(window_loss_sums['regression'], 1e-12):.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
                 f"nbr/reg {neighbour_future_loss_weight * window_loss_sums['neighbour_future'] / max(window_loss_sums['regression'], 1e-12):.4f} "
-                f"phys {window_loss_sums['physics_excess'] / LOG_EVERY_BATCHES:.4f} | "
+                f"| "
                 f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} | "
                 f"lr {learning_rate:.3e} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
@@ -254,7 +248,6 @@ def main():
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--heading-loss-weight", type=float, required=True)
     parser.add_argument("--neighbour-future-loss-weight", type=float, required=True)
-    parser.add_argument("--physics-loss-weight", type=float, required=True)
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
     parser.add_argument("--resume", action="store_true")
@@ -339,7 +332,7 @@ def main():
         )
         averages, monitor, seconds = train_epoch(
             predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
-            arguments.neighbour_future_loss_weight, arguments.physics_loss_weight,
+            arguments.neighbour_future_loss_weight,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             epoch_index * steps_per_epoch, total_optimiser_steps,
@@ -350,7 +343,7 @@ def main():
             f" + cls {averages['classification']:.4f}"
             f" + hdg {averages['heading']:.4f}"
             f" + nbr {averages['neighbour_future']:.4f}"
-            f" + phys {averages['physics_excess']:.4f}) | "
+            f") | "
             f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
             f"kept modes {monitor['mean_kept_modes']:.2f}"
             f" | backfilled {100 * monitor['backfill_rate']:.0f}% | "
