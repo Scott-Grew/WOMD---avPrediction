@@ -61,9 +61,13 @@ def submission_trajectories_and_confidences(predictor, samples):
 
 def load_predictor(checkpoint_path, anchors_path):
     with np.load(anchors_path) as anchors_file:
+        contract.check_artifact_provenance(
+            anchors_file["provenance"] if "provenance" in anchors_file else None,
+            anchors_path, "Refit them with fit_anchors.py.",
+        )
         unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
     predictor = model.MotionPredictor(unit_anchors)
-    predictor.load_state_dict(torch.load(checkpoint_path, map_location="cpu")["model_state"])
+    predictor.load_state_dict(model.load_checkpoint_state(checkpoint_path)["model_state"])
     return predictor.eval()
 
 
@@ -94,6 +98,7 @@ def write_submission_arrays(predictor, staged_directory, output_path):
         track_id=np.array(track_ids, dtype=np.int64),
         world_trajectories=stacked_trajectories,
         confidences=np.stack(confidences).astype(np.float64),
+        provenance=contract.artifact_provenance("submit.py", staged_directory),
     )
     return len(track_ids)
 

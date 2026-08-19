@@ -10,7 +10,7 @@ import fit_anchors
 import measure_sensitivity
 import submit
 import train
-from waymo_open_dataset.protos import scenario_pb2
+from womd_protos import scenario_pb2
 from womd import baseline, contract, frame_ops, loader, loss, metrics, model, pipeline, store, tfrecord
 
 STAGED_DIRECTORY = Path(__file__).resolve().parents[2] / "data" / "staged"
@@ -117,8 +117,6 @@ def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
         "max_polylines_in_batch": torch.tensor(5),
     }
     batch["neighbour_history_mask"][:, 5] = False
-    batch["agent_signal_history"][0, :, 4] = 1.0
-    batch["neighbour_signal_history"][:, 2, :, 6] = 1.0
     batch["map_chunk_signal_history"][0, 1:3, :, 6] = 1.0
     batch["map_chunk_lane_context"][0, 1:3, contract.LANE_CONTEXT_REACHABLE] = 1.0
     batch["map_rows"][:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
@@ -130,7 +128,6 @@ def test_v_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
     permuted = dict(batch)
     permuted["neighbour_history"] = batch["neighbour_history"][:, neighbour_order]
     permuted["neighbour_history_mask"] = batch["neighbour_history_mask"][:, neighbour_order]
-    permuted["neighbour_signal_history"] = batch["neighbour_signal_history"][:, neighbour_order]
     permuted["map_rows"] = batch["map_rows"][map_order]
     permuted["map_dot_polyline_slot"] = batch["map_dot_polyline_slot"][map_order]
 
@@ -238,6 +235,95 @@ def test_a_lane_reached_only_sideways_is_flagged_a_lane_change_at_the_distance_i
     )
 
 
+def two_lane_signal_scenario(track_count, signalled_lane_history):
+    signalled_lane = lane_polyline_rows(0.0, 11)
+    unsignalled_lane = lane_polyline_rows(0.0, 11)
+    unsignalled_lane[:, contract.MAP_POSITION.start + 1] = 40.0
+    feature_lengths = np.array([11, 11], dtype=np.int64)
+    polyline_signal_histories = np.zeros(
+        (2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES), dtype=np.float32
+    )
+    polyline_signal_histories[0] = signalled_lane_history
+
+    track_rows = np.zeros(
+        (track_count, contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
+    )
+    track_valid = np.ones((track_count, contract.TOTAL_STEPS), dtype=bool)
+    track_rows[:, :, contract.AGENT_HEADING_COSINE] = 1.0
+    track_rows[0, :, contract.AGENT_POSITION] = np.array([5.0, 0.0])
+    track_rows[1, :, contract.AGENT_POSITION] = np.array([5.0, 40.0])
+    if track_count > 2:
+        track_rows[2, :, contract.AGENT_POSITION] = np.array([7.0, 0.0])
+        track_valid[2, contract.CURRENT_STEP_INDEX] = False
+
+    scenario_array = {
+        "map_rows": np.concatenate([signalled_lane, unsignalled_lane]),
+        "feature_lengths": feature_lengths,
+        "feature_ids": np.array([101, 102], dtype=np.int64),
+        "lane_connections": np.zeros((0, contract.LANE_CONNECTION_WIDTH), dtype=np.int64),
+        "lane_neighbour_ids": np.zeros((0, contract.LANE_NEIGHBOUR_ID_WIDTH), dtype=np.int64),
+        "stop_sign_controlled_lanes": np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
+        "polyline_signal_histories": polyline_signal_histories,
+        "track_rows": track_rows,
+        "track_valid": track_valid,
+        "scenario_id": np.array("two-lane"),
+        "track_ids": np.arange(track_count),
+        "is_designated_target": np.ones(track_count, dtype=bool),
+        "is_object_of_interest": np.zeros(track_count, dtype=bool),
+    }
+    return loader.with_derived_arrays(scenario_array)
+
+
+def test_each_agent_carries_the_signal_history_of_the_lane_it_is_assigned_to():
+    signalled_lane_history = np.zeros(
+        (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES), dtype=np.float32
+    )
+    signalled_lane_history[:8, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_STOP")] = 1.0
+    signalled_lane_history[8:, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")] = 1.0
+
+    three_agent_sample = loader.build_sample(
+        two_lane_signal_scenario(3, signalled_lane_history), 0
+    )
+    two_agent_sample = loader.build_sample(two_lane_signal_scenario(2, signalled_lane_history), 0)
+
+    assert np.array_equal(three_agent_sample["agent_signal_history"], signalled_lane_history)
+    assert np.all(three_agent_sample["neighbour_signal_history"][0] == 0.0)
+    assert np.all(three_agent_sample["neighbour_signal_history"][1] == 0.0)
+
+    batch = loader.build_batch([three_agent_sample, two_agent_sample])
+    assert batch["agent_signal_history"].shape == (
+        2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+    )
+    assert batch["neighbour_signal_history"].shape == (
+        2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+    )
+    assert np.all(batch["neighbour_signal_history"][1, 1] == 0.0)
+
+    torch.manual_seed(47)
+    encoder = model.SceneEncoder()
+    with torch.no_grad():
+        projected_agent = encoder.signal_projection(
+            torch.from_numpy(batch["agent_signal_history"]).flatten(start_dim=-2)
+        )
+        projected_neighbours = encoder.signal_projection(
+            torch.from_numpy(batch["neighbour_signal_history"]).flatten(start_dim=-2)
+        )
+
+    assert torch.any(projected_agent != 0.0)
+    assert torch.all(projected_neighbours[1, 1] == 0.0)
+
+    torch_batch = {name: torch.from_numpy(array) for name, array in batch.items()}
+    silenced_batch = dict(torch_batch)
+    silenced_batch["agent_signal_history"] = torch.zeros_like(
+        torch_batch["agent_signal_history"]
+    )
+    with torch.no_grad():
+        tokens, _ = encoder(torch_batch)
+        silenced_tokens, _ = encoder(silenced_batch)
+
+    assert not torch.allclose(tokens[0, 0], silenced_tokens[0, 0])
+
+
 def test_neighbour_future_loss_scores_only_the_neighbour_steps_that_were_logged():
     torch.manual_seed(23)
     logged_positions = torch.randn(2, 3, contract.FUTURE_STEPS, 2)
@@ -301,6 +387,41 @@ def test_padded_chunk_slot_stays_exactly_zero_through_both_map_projections():
     assert torch.any(map_tokens[0] != 0.0)
 
 
+def test_an_absent_neighbours_token_is_unchanged_by_the_predicted_future_feedback():
+    torch.manual_seed(29)
+    predictor = model.MotionPredictor(model.unit_anchor_offsets_per_type()).eval()
+    batch = {
+        "agent_history": torch.randn(1, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "agent_history_mask": torch.ones(1, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(1, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(1, 2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "agent_signal_history": torch.zeros(
+            1, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "neighbour_signal_history": torch.zeros(
+            1, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_rows": torch.randn(10, contract.MAP_FEATURE_DIM),
+        "map_dot_polyline_slot": torch.arange(10) // 5,
+        "map_chunk_signal_history": torch.zeros(
+            1, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_chunk_lane_context": torch.zeros(1, 2, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(2),
+    }
+    batch["map_rows"][:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
+        0, contract.NUM_BOUNDARY_CROSSING_CODES, (10, 2), dtype=torch.float32
+    )
+    batch["neighbour_history_mask"][:, 1] = False
+
+    with torch.no_grad():
+        tokens_before_feedback, _ = predictor.scene_encoder(batch)
+        tokens_after_feedback, *_ = predictor.encode_scene_and_modes(batch)
+
+    assert torch.equal(tokens_after_feedback[:, 2], tokens_before_feedback[:, 2])
+    assert not torch.equal(tokens_after_feedback[:, 1], tokens_before_feedback[:, 1])
+
+
 def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
     step_offsets = np.arange(-contract.CURRENT_STEP_INDEX, contract.FUTURE_STEPS + 1)
     elapsed = step_offsets * baseline.TIMESTEP_SECONDS
@@ -341,9 +462,9 @@ def test_v4_null_baselines_reproduce_the_motion_each_one_assumes():
     assert torch.equal(pruned, turning_trajectories.expand(-1, contract.NUM_PREDICTED_MODES, -1, -1))
 
 
-def test_v4_anchor_null_drives_the_reachable_distance_to_each_most_used_anchor_in_a_straight_line():
+def test_v4_anchor_null_drives_straight_to_each_most_used_anchor_in_metres_regardless_of_speed():
     unit_anchors = model.unit_anchor_offsets_per_type() * torch.tensor(
-        [1.0, 0.6, 0.3]
+        [40.0, 24.0, 12.0]
     )[:, None, None]
     driven_types = torch.tensor([0, contract.NUM_OBJECT_TYPES - 1])
     current_speeds = torch.tensor([8.0, 0.0])
@@ -359,14 +480,12 @@ def test_v4_anchor_null_drives_the_reachable_distance_to_each_most_used_anchor_i
     trajectories, confidence_logits = baseline.straight_lines_to_most_used_anchors(
         batch, unit_anchors
     )
-    reachable_distance_metres = model.agent_reachable_distance(agent_history)
 
     assert trajectories.shape == (2, contract.NUM_PREDICTED_MODES, contract.FUTURE_STEPS, 2)
     assert confidence_logits.shape == (2, contract.NUM_PREDICTED_MODES)
     assert torch.allclose(
         trajectories[:, :, -1],
-        reachable_distance_metres[:, None, None]
-        * unit_anchors[driven_types][:, : contract.NUM_PREDICTED_MODES],
+        unit_anchors[driven_types][:, : contract.NUM_PREDICTED_MODES],
         atol=1e-4,
     )
 
@@ -534,7 +653,7 @@ def test_every_emitted_trajectory_stays_in_the_curve_family_after_the_anchor_ram
 
 def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
     torch.manual_seed(29)
-    unit_anchors = model.unit_anchor_offsets_per_type()
+    unit_anchors = model.unit_anchor_offsets_per_type() * 40.0
     predictor = model.MotionPredictor(unit_anchors).eval()
     with torch.no_grad():
         predictor.mode_decoder.queries.zero_()
@@ -586,7 +705,7 @@ def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
 def test_a_mode_endpoint_carries_its_anchor_at_the_distance_the_loss_assigns_by():
     torch.manual_seed(37)
     unit_anchors = model.unit_anchor_offsets_per_type() * torch.tensor(
-        [1.0, 0.6, 0.3]
+        [40.0, 24.0, 12.0]
     )[:, None, None]
     predictor = model.MotionPredictor(unit_anchors).eval()
     with torch.no_grad():
@@ -624,22 +743,16 @@ def test_a_mode_endpoint_carries_its_anchor_at_the_distance_the_loss_assigns_by(
         "max_polylines_in_batch": torch.tensor(2),
     }
 
-    reachable_distance_metres = model.agent_reachable_distance(agent_history)
     with torch.no_grad():
         trajectories, _ = predictor(batch)
     endpoints = trajectories[:, :, -1]
 
-    assert torch.allclose(
-        endpoints,
-        unit_anchors[driven_types] * reachable_distance_metres[:, None, None],
-        atol=1e-4,
-    )
+    assert torch.allclose(endpoints, unit_anchors[driven_types], atol=1e-4)
 
     ramp = torch.arange(1, contract.FUTURE_STEPS + 1) / contract.FUTURE_STEPS
     logged_futures = endpoints[0][:, None, :] * ramp[None, :, None]
     assigned_mode = loss.anchor_assigned_mode(
         predictor.unit_anchors[driven_types[0]].expand(model.QUERY_COUNT, -1, -1),
-        reachable_distance_metres[:1].expand(model.QUERY_COUNT),
         logged_futures,
         torch.ones(model.QUERY_COUNT, contract.FUTURE_STEPS, dtype=torch.bool),
     )
@@ -649,10 +762,10 @@ def test_a_mode_endpoint_carries_its_anchor_at_the_distance_the_loss_assigns_by(
 
 def test_two_agents_alike_but_for_their_object_type_get_their_own_types_anchor_set():
     torch.manual_seed(71)
-    geometric_fan = model.unit_anchor_offsets()
+    geometric_fan = model.unit_anchor_offsets() * 40.0
     vehicle_index = contract.PREDICTED_OBJECT_TYPES.index("TYPE_VEHICLE")
     pedestrian_index = contract.PREDICTED_OBJECT_TYPES.index("TYPE_PEDESTRIAN")
-    unit_anchors = model.unit_anchor_offsets_per_type()
+    unit_anchors = model.unit_anchor_offsets_per_type() * 40.0
     unit_anchors[pedestrian_index] = 0.6 * geometric_fan.flip(0)
     predictor = model.MotionPredictor(unit_anchors).eval()
     with torch.no_grad():
@@ -692,76 +805,67 @@ def test_two_agents_alike_but_for_their_object_type_get_their_own_types_anchor_s
 
     with torch.no_grad():
         (
-            trajectories, _, _, _, reachable_distance_metres, selected_unit_anchors, _,
+            trajectories, _, _, _, _, selected_unit_anchors, _,
         ) = predictor.predict_with_heading(batch)
     endpoints = trajectories[:, :, -1]
 
     assert torch.allclose(selected_unit_anchors[0], unit_anchors[vehicle_index], atol=1e-6)
     assert torch.allclose(selected_unit_anchors[1], unit_anchors[pedestrian_index], atol=1e-6)
-    assert torch.allclose(
-        endpoints[0], unit_anchors[vehicle_index] * reachable_distance_metres[0], atol=1e-4
-    )
-    assert torch.allclose(
-        endpoints[1], unit_anchors[pedestrian_index] * reachable_distance_metres[1], atol=1e-4
-    )
+    assert torch.allclose(endpoints[0], unit_anchors[vehicle_index], atol=1e-4)
+    assert torch.allclose(endpoints[1], unit_anchors[pedestrian_index], atol=1e-4)
     assert float((endpoints[0] - endpoints[1]).norm(dim=-1).min()) > 1.0
 
     shared_target_mode = 3
-    logged_endpoint = (
-        unit_anchors[vehicle_index, shared_target_mode] * reachable_distance_metres[0]
-    )
+    logged_endpoint = unit_anchors[vehicle_index, shared_target_mode]
     ramp = torch.arange(1, contract.FUTURE_STEPS + 1) / contract.FUTURE_STEPS
     future_positions = (logged_endpoint[None, :] * ramp[:, None]).expand(2, -1, -1)
     assigned_mode = loss.anchor_assigned_mode(
-        selected_unit_anchors, reachable_distance_metres, future_positions,
+        selected_unit_anchors, future_positions,
         torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
     )
 
     assert int(assigned_mode[0]) == shared_target_mode
     assert int(assigned_mode[1]) != shared_target_mode
     assert int(assigned_mode[1]) == int(
-        (unit_anchors[pedestrian_index] * reachable_distance_metres[1] - logged_endpoint)
-        .norm(dim=-1).argmin()
+        (unit_anchors[pedestrian_index] - logged_endpoint).norm(dim=-1).argmin()
     )
 
 
 def test_opposed_logged_endpoints_are_assigned_to_opposed_anchor_territories():
-    unit_anchors = model.unit_anchor_offsets()
-    reachable_distance_metres = torch.tensor([40.0, 40.0])
+    unit_anchors = model.unit_anchor_offsets() * 40.0
     future_positions = torch.zeros(2, contract.FUTURE_STEPS, 2)
     future_positions[0, :, 0] = torch.linspace(0.5, 40.0, contract.FUTURE_STEPS)
     future_positions[1, :, 0] = torch.linspace(-0.5, -40.0, contract.FUTURE_STEPS)
     future_mask = torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool)
 
     assigned_mode = loss.anchor_assigned_mode(
-        unit_anchors.expand(2, -1, -1), reachable_distance_metres, future_positions, future_mask
+        unit_anchors.expand(2, -1, -1), future_positions, future_mask
     )
 
     assert assigned_mode[0] != assigned_mode[1]
-    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([1.0, 0.0]), atol=1e-6)
-    assert torch.allclose(unit_anchors[assigned_mode[1]], torch.tensor([-1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([40.0, 0.0]), atol=1e-4)
+    assert torch.allclose(unit_anchors[assigned_mode[1]], torch.tensor([-40.0, 0.0]), atol=1e-4)
 
 
 def test_assignment_reads_the_last_valid_future_step_and_not_the_padded_tail():
-    unit_anchors = model.unit_anchor_offsets()
-    reachable_distance_metres = torch.tensor([40.0])
+    unit_anchors = model.unit_anchor_offsets() * 40.0
     future_positions = torch.zeros(1, contract.FUTURE_STEPS, 2)
     future_positions[0, :10, 0] = 40.0
     future_mask = torch.zeros(1, contract.FUTURE_STEPS, dtype=torch.bool)
     future_mask[0, :10] = True
 
     assigned_mode = loss.anchor_assigned_mode(
-        unit_anchors.expand(1, -1, -1), reachable_distance_metres, future_positions, future_mask
+        unit_anchors.expand(1, -1, -1), future_positions, future_mask
     )
     padded_tail_mode = loss.anchor_assigned_mode(
-        unit_anchors.expand(1, -1, -1), reachable_distance_metres, future_positions,
+        unit_anchors.expand(1, -1, -1), future_positions,
         torch.ones_like(future_mask),
     )
 
-    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([1.0, 0.0]), atol=1e-6)
+    assert torch.allclose(unit_anchors[assigned_mode[0]], torch.tensor([40.0, 0.0]), atol=1e-4)
     assert padded_tail_mode[0] != assigned_mode[0]
     assert float(unit_anchors[padded_tail_mode[0]].norm()) == pytest.approx(
-        1.0 / model.ANCHOR_DISTANCE_COUNT
+        40.0 / model.ANCHOR_DISTANCE_COUNT
     )
 
 
@@ -777,7 +881,7 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
 
     (
         trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-        reachable_distance_metres, selected_unit_anchors, neighbour_future_positions,
+        predicted_speed, selected_unit_anchors, neighbour_future_positions,
     ) = predictor.predict_with_heading(batch)
     assert neighbour_future_positions.shape == (
         batch["neighbour_future_positions"].shape[:2] + (contract.FUTURE_STEPS, 2)
@@ -787,8 +891,9 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     )
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+        predicted_speed,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
-        selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
+        selected_unit_anchors, 1.0, 1.0, 1.0,
     )
     neighbour_future = loss.neighbour_future_loss(
         neighbour_future_positions,
@@ -856,95 +961,6 @@ def test_submission_world_frame_returns_the_logged_future_to_its_logged_place():
     )
 
 
-def two_lane_signal_scenario(track_count, signalled_lane_history):
-    signalled_lane = lane_polyline_rows(0.0, 11)
-    unsignalled_lane = lane_polyline_rows(0.0, 11)
-    unsignalled_lane[:, contract.MAP_POSITION.start + 1] = 40.0
-    feature_lengths = np.array([11, 11], dtype=np.int64)
-    polyline_signal_histories = np.zeros(
-        (2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES), dtype=np.float32
-    )
-    polyline_signal_histories[0] = signalled_lane_history
-
-    track_rows = np.zeros(
-        (track_count, contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
-    )
-    track_valid = np.ones((track_count, contract.TOTAL_STEPS), dtype=bool)
-    track_rows[:, :, contract.AGENT_HEADING_COSINE] = 1.0
-    track_rows[0, :, contract.AGENT_POSITION] = np.array([5.0, 0.0])
-    track_rows[1, :, contract.AGENT_POSITION] = np.array([5.0, 40.0])
-    if track_count > 2:
-        track_rows[2, :, contract.AGENT_POSITION] = np.array([7.0, 0.0])
-        track_valid[2, contract.CURRENT_STEP_INDEX] = False
-
-    scenario_array = {
-        "map_rows": np.concatenate([signalled_lane, unsignalled_lane]),
-        "feature_lengths": feature_lengths,
-        "feature_ids": np.array([101, 102], dtype=np.int64),
-        "lane_connections": np.zeros((0, contract.LANE_CONNECTION_WIDTH), dtype=np.int64),
-        "lane_neighbour_ids": np.zeros((0, contract.LANE_NEIGHBOUR_ID_WIDTH), dtype=np.int64),
-        "stop_sign_controlled_lanes": np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
-        "polyline_signal_histories": polyline_signal_histories,
-        "track_rows": track_rows,
-        "track_valid": track_valid,
-        "scenario_id": np.array("two-lane"),
-        "track_ids": np.arange(track_count),
-        "is_designated_target": np.ones(track_count, dtype=bool),
-        "is_object_of_interest": np.zeros(track_count, dtype=bool),
-    }
-    return loader.with_derived_arrays(scenario_array)
-
-
-def test_each_agent_carries_the_signal_history_of_the_lane_it_is_assigned_to():
-    signalled_lane_history = np.zeros(
-        (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES), dtype=np.float32
-    )
-    signalled_lane_history[:8, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_STOP")] = 1.0
-    signalled_lane_history[8:, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")] = 1.0
-
-    three_agent_sample = loader.build_sample(
-        two_lane_signal_scenario(3, signalled_lane_history), 0
-    )
-    two_agent_sample = loader.build_sample(two_lane_signal_scenario(2, signalled_lane_history), 0)
-
-    assert np.array_equal(three_agent_sample["agent_signal_history"], signalled_lane_history)
-    assert np.all(three_agent_sample["neighbour_signal_history"][0] == 0.0)
-    assert np.all(three_agent_sample["neighbour_signal_history"][1] == 0.0)
-
-    batch = loader.build_batch([three_agent_sample, two_agent_sample])
-    assert batch["agent_signal_history"].shape == (
-        2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
-    )
-    assert batch["neighbour_signal_history"].shape == (
-        2, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
-    )
-    assert np.all(batch["neighbour_signal_history"][1, 1] == 0.0)
-
-    torch.manual_seed(47)
-    encoder = model.SceneEncoder()
-    with torch.no_grad():
-        projected_agent = encoder.signal_projection(
-            torch.from_numpy(batch["agent_signal_history"]).flatten(start_dim=-2)
-        )
-        projected_neighbours = encoder.signal_projection(
-            torch.from_numpy(batch["neighbour_signal_history"]).flatten(start_dim=-2)
-        )
-
-    assert torch.any(projected_agent != 0.0)
-    assert torch.all(projected_neighbours[1, 1] == 0.0)
-
-    torch_batch = {name: torch.from_numpy(array) for name, array in batch.items()}
-    silenced_batch = dict(torch_batch)
-    silenced_batch["agent_signal_history"] = torch.zeros_like(
-        torch_batch["agent_signal_history"]
-    )
-    with torch.no_grad():
-        tokens, _ = encoder(torch_batch)
-        silenced_tokens, _ = encoder(silenced_batch)
-
-    assert not torch.allclose(tokens[0, 0], silenced_tokens[0, 0])
-
-
 def test_the_heading_rides_one_bernstein_curve_of_its_own_control_pairs():
     torch.manual_seed(43)
     decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
@@ -954,8 +970,8 @@ def test_the_heading_rides_one_bernstein_curve_of_its_own_control_pairs():
     token_present = torch.ones(2, 9, dtype=torch.bool)
 
     with torch.no_grad():
-        _, heading_cosine_sine, _, _, _ = decoder(
-            tokens, token_present, torch.tensor([30.0, 70.0]), torch.zeros(2, dtype=torch.long)
+        _, heading_cosine_sine, _, _, _, _ = decoder(
+            tokens, token_present, torch.zeros(2, dtype=torch.long)
         )
 
     time_fractions = (
@@ -1015,8 +1031,8 @@ def test_the_step_uncertainty_rides_one_bernstein_curve_and_never_leaves_the_cla
         decoder.trajectory_head[-1].bias[log_standard_deviation_start:] = (
             moderate_control_pairs.flatten()
         )
-        _, _, moderate_log_standard_deviation, _, _ = decoder(
-            tokens, token_present, torch.tensor([30.0, 70.0]), torch.zeros(2, dtype=torch.long)
+        _, _, moderate_log_standard_deviation, _, _, _ = decoder(
+            tokens, token_present, torch.zeros(2, dtype=torch.long)
         )
 
     time_fractions = (
@@ -1044,8 +1060,8 @@ def test_the_step_uncertainty_rides_one_bernstein_curve_and_never_leaves_the_cla
         decoder.trajectory_head[-1].bias[log_standard_deviation_start:] = torch.tensor(
             [-1e3, 1e3, -1e3, 1e3, -1e3, 1e3]
         )
-        _, _, extreme_log_standard_deviation, _, _ = decoder(
-            tokens, token_present, torch.tensor([30.0, 70.0]), torch.zeros(2, dtype=torch.long)
+        _, _, extreme_log_standard_deviation, _, _, _ = decoder(
+            tokens, token_present, torch.zeros(2, dtype=torch.long)
         )
     extreme_standard_deviation = extreme_log_standard_deviation.exp()
     floor_metres = math.exp(model.MINIMUM_LOG_STANDARD_DEVIATION)
@@ -1069,18 +1085,19 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
     heading_cosine_sine = future_headings.unsqueeze(1).expand(-1, model.QUERY_COUNT, -1, -1)
     confidence_logits = torch.zeros(sample_count, model.QUERY_COUNT)
     unit_anchors = model.unit_anchor_offsets().expand(sample_count, -1, -1)
-    reachable_distance_metres = torch.full((sample_count,), 40.0)
     displacement = torch.tensor([0.3, -0.4])
+    predicted_speed = torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS)
 
     def regression_at(log_standard_deviation, error):
         trajectories = (
             future_positions.unsqueeze(1).expand(-1, model.QUERY_COUNT, -1, -1) + error
         )
-        _, regression, _, _ = loss.prediction_loss(
+        _, regression, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine,
             torch.full_like(trajectories, log_standard_deviation), confidence_logits,
+            predicted_speed,
             future_positions, future_headings, future_mask,
-            unit_anchors, reachable_distance_metres, 1.0, 1.0,
+            unit_anchors, 1.0, 1.0, 1.0,
         )
         return float(regression)
 
@@ -1099,6 +1116,57 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
         )
 
 
+def test_a_straight_constant_speed_control_polygon_predicts_that_constant_speed_analytically():
+    torch.manual_seed(61)
+    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
+    control_point_spacing = torch.tensor([3.0, 4.0])
+    equally_spaced_control_points = control_point_spacing * torch.arange(
+        1, model.TRAJECTORY_CONTROL_POINTS + 1, dtype=torch.float32
+    )[:, None]
+
+    with torch.no_grad():
+        decoder.trajectory_head[-1].weight.zero_()
+        decoder.trajectory_head[-1].bias.zero_()
+        decoder.trajectory_head[-1].bias[: model.POSITION_CONTROL_VALUES] = (
+            equally_spaced_control_points.flatten()
+        )
+        normed_tokens = decoder.scene_norm(torch.randn(2, 7, model.HIDDEN_DIM))
+        token_present = torch.ones(2, 7, dtype=torch.bool)
+        _, _, _, _, predicted_speed = decoder.decode_from_anchors(
+            normed_tokens, token_present, torch.zeros(2, model.QUERY_COUNT, 2), 2
+        )
+
+    expected_speed = float(
+        (model.TRAJECTORY_CONTROL_POINTS * control_point_spacing).norm()
+        / contract.FUTURE_HORIZON_SECONDS
+    )
+    assert torch.allclose(predicted_speed, torch.full_like(predicted_speed, expected_speed), atol=1e-4)
+
+
+def test_predicted_speed_carries_the_anchor_motion_the_emitted_trajectory_carries():
+    torch.manual_seed(67)
+    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
+    anchor_endpoint = torch.tensor([24.0, -7.0])
+
+    with torch.no_grad():
+        decoder.trajectory_head[-1].weight.zero_()
+        decoder.trajectory_head[-1].bias.zero_()
+        normed_tokens = decoder.scene_norm(torch.randn(2, 7, model.HIDDEN_DIM))
+        token_present = torch.ones(2, 7, dtype=torch.bool)
+        anchored_position, _, _, _, predicted_speed = decoder.decode_from_anchors(
+            normed_tokens, token_present,
+            anchor_endpoint.expand(2, model.QUERY_COUNT, 2), 2,
+        )
+
+    assert torch.allclose(
+        anchored_position[:, :, -1], anchor_endpoint.expand(2, model.QUERY_COUNT, 2), atol=1e-4
+    )
+    anchor_only_speed = float(anchor_endpoint.norm() / contract.FUTURE_HORIZON_SECONDS)
+    assert torch.allclose(
+        predicted_speed, torch.full_like(predicted_speed, anchor_only_speed), atol=1e-4
+    )
+
+
 def test_every_feature_column_the_contract_declares_has_a_sensitivity_perturbation():
     measure_sensitivity.assert_selectors_cover_every_column(
         measure_sensitivity.AGENT_FEATURE_SELECTORS, contract.AGENT_FEATURE_DIM, "agent"
@@ -1109,3 +1177,137 @@ def test_every_feature_column_the_contract_declares_has_a_sensitivity_perturbati
     measure_sensitivity.assert_selectors_cover_every_column(
         measure_sensitivity.LANE_CONTEXT_SELECTORS, contract.LANE_CONTEXT_DIM, "lane context"
     )
+
+
+def test_heading_term_is_zero_at_the_logged_heading_and_positive_away_from_it():
+    torch.manual_seed(73)
+    sample_count = 3
+    future_positions = torch.randn(sample_count, contract.FUTURE_STEPS, 2)
+    future_headings = torch.nn.functional.normalize(
+        torch.randn(sample_count, contract.FUTURE_STEPS, 2), dim=-1
+    )
+    future_mask = torch.ones(sample_count, contract.FUTURE_STEPS, dtype=torch.bool)
+    trajectories = future_positions.unsqueeze(1).expand(-1, model.QUERY_COUNT, -1, -1)
+    log_standard_deviation = torch.zeros_like(trajectories)
+    confidence_logits = torch.zeros(sample_count, model.QUERY_COUNT)
+    unit_anchors = model.unit_anchor_offsets().expand(sample_count, -1, -1)
+    predicted_speed = torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS)
+
+    def heading_term(heading_cosine_sine):
+        _, _, heading, _, _ = loss.prediction_loss(
+            trajectories, heading_cosine_sine, log_standard_deviation, confidence_logits,
+            predicted_speed,
+            future_positions, future_headings, future_mask,
+            unit_anchors, 1.0, 1.0, 1.0,
+        )
+        return float(heading)
+
+    exact = future_headings.unsqueeze(1).expand(-1, model.QUERY_COUNT, -1, -1)
+    quarter_turn = torch.stack([-exact[..., 1], exact[..., 0]], dim=-1)
+    shrunken_exact = 1e-6 * exact
+
+    assert heading_term(exact) == pytest.approx(0.0, abs=1e-6)
+    assert heading_term(quarter_turn) > 1.0
+    assert heading_term(shrunken_exact) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_artifact_provenance_round_trips_and_refuses_missing_or_mismatched_stamps():
+    stamp = contract.artifact_provenance("test_invariants.py", "unit-test-source")
+    checked = contract.check_artifact_provenance(stamp, "in-memory", "Regenerate.")
+    assert checked["code_version"] == contract.STAGING_CODE_VERSION
+    assert checked["producer"] == "test_invariants.py"
+
+    with pytest.raises(AssertionError):
+        contract.check_artifact_provenance(None, "in-memory", "Regenerate.")
+
+    import json as json_module
+    stale = json_module.dumps({
+        "code_version": "not-the-working-tree", "producer": "x", "source": "y"
+    })
+    with pytest.raises(AssertionError):
+        contract.check_artifact_provenance(stale, "in-memory", "Regenerate.")
+
+
+def test_scorer_tensors_group_per_scenario_with_every_agent_in_the_ground_truth(tmp_path):
+    import importlib.util
+    runner_spec = importlib.util.spec_from_file_location(
+        "container_runner", Path(__file__).parent.parent / "container" / "runner.py"
+    )
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+
+    scenario_agent_counts = {"scn_a": 3, "scn_b": 2}
+    scenario_target_track_ids = {"scn_a": [20, 30], "scn_b": [10]}
+    for scenario_id, agent_count in scenario_agent_counts.items():
+        track_rows = np.zeros(
+            (agent_count, contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM), dtype=np.float32
+        )
+        track_rows[:, :, contract.AGENT_HEADING_COSINE] = 1.0
+        track_rows[:, :, contract.AGENT_TYPE.start] = 1.0
+        for track_index in range(agent_count):
+            track_rows[track_index, :, contract.AGENT_POSITION.start] = float(track_index)
+        np.savez(
+            tmp_path / f"{scenario_id}.npz",
+            track_rows=track_rows,
+            track_valid=np.ones((agent_count, contract.TOTAL_STEPS), dtype=bool),
+            track_ids=np.arange(10, 10 * (agent_count + 1), 10, dtype=np.int64),
+            is_designated_target=np.ones(agent_count, dtype=bool),
+            is_object_of_interest=np.zeros(agent_count, dtype=bool),
+            map_rows=np.zeros((0, contract.MAP_FEATURE_DIM), dtype=np.float32),
+            feature_lengths=np.zeros(0, dtype=np.int64),
+            feature_ids=np.zeros(0, dtype=np.int64),
+            feature_is_interpolating=np.zeros(0, dtype=bool),
+            polyline_signal_histories=np.zeros(
+                (0, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES), dtype=np.float32
+            ),
+            lane_connections=np.zeros((0, contract.LANE_CONNECTION_WIDTH), dtype=np.int64),
+            lane_neighbour_ids=np.zeros((0, contract.LANE_NEIGHBOUR_ID_WIDTH), dtype=np.int64),
+            lane_neighbour_bounds=np.zeros(
+                (0, contract.LANE_NEIGHBOUR_BOUND_WIDTH), dtype=np.float32
+            ),
+            lane_boundary_ids=np.zeros((0, contract.LANE_BOUNDARY_ID_WIDTH), dtype=np.int64),
+            lane_boundary_bounds=np.zeros(
+                (0, contract.LANE_BOUNDARY_BOUND_WIDTH), dtype=np.float32
+            ),
+            stop_sign_controlled_lanes=np.zeros((0, contract.STOP_SIGN_LANE_WIDTH), dtype=np.int64),
+            frame_origin=np.zeros(2, dtype=np.float32),
+            frame_heading=np.float32(0.0),
+            scenario_id=scenario_id,
+        )
+
+    prediction_scenario_ids, prediction_track_ids = [], []
+    for scenario_id, target_track_ids in scenario_target_track_ids.items():
+        for track_id in target_track_ids:
+            prediction_scenario_ids.append(scenario_id)
+            prediction_track_ids.append(track_id)
+    target_count = len(prediction_track_ids)
+    predictions = {
+        "scenario_id": np.array(prediction_scenario_ids),
+        "track_id": np.array(prediction_track_ids, dtype=np.int64),
+        "world_trajectories": np.random.default_rng(0).normal(
+            size=(target_count, contract.NUM_PREDICTED_MODES, contract.SUBMISSION_STEPS, 2)
+        ),
+        "confidences": np.full((target_count, contract.NUM_PREDICTED_MODES), 1.0 / 6.0),
+    }
+
+    tensors = runner.build_motion_metric_tensors(predictions, tmp_path)
+
+    assert tensors["ground_truth_trajectory"].shape == (2, 3, contract.TOTAL_STEPS, 7)
+    assert tensors["prediction_trajectory"].shape == (
+        2, 2, contract.NUM_PREDICTED_MODES, 1, contract.SUBMISSION_STEPS, 2
+    )
+    assert int(tensors["prediction_ground_truth_indices_mask"].sum()) == target_count
+
+    scenario_row = {scenario_id: row for row, scenario_id in enumerate(tensors["scenario_id"])}
+    a_row, b_row = scenario_row["scn_a"], scenario_row["scn_b"]
+    assert tensors["ground_truth_is_valid"][a_row].all()
+    assert tensors["ground_truth_is_valid"][b_row, :2].all()
+    assert not tensors["ground_truth_is_valid"][b_row, 2:].any()
+    assert not tensors["prediction_ground_truth_indices_mask"][b_row, 1:].any()
+
+    for slot_index, expected_track_id in enumerate(scenario_target_track_ids["scn_a"]):
+        agent_row = int(tensors["prediction_ground_truth_indices"][a_row, slot_index, 0])
+        assert tensors["object_id"][a_row, agent_row] == expected_track_id
+        assert tensors["ground_truth_trajectory"][
+            a_row, agent_row, 0, 0
+        ] == pytest.approx(agent_row * 1.0)

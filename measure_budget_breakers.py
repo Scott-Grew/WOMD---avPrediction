@@ -9,9 +9,6 @@ from womd import contract, loader, model
 
 def main():
     staged_directory = Path(sys.argv[1])
-    endpoints_cache_path = (
-        staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
-    )
     breakers_path = staged_directory.parent / f"{staged_directory.name}_budget_breakers.npz"
 
     fraction_endpoints = []
@@ -50,12 +47,7 @@ def main():
                     "future": sample["future_positions"][valid_future_steps],
                 })
 
-    np.savez(
-        endpoints_cache_path,
-        endpoints=np.stack(fraction_endpoints).astype(np.float32),
-        predicted_type_index=np.array(type_indices, dtype=np.int64),
-    )
-    print(f"cache written: {endpoints_cache_path} ({len(fraction_endpoints)} endpoints)")
+    print(f"{len(fraction_endpoints)} endpoints measured")
 
     print(f"\n{len(breakers)} samples end past their own reachable budget:")
     for breaker in sorted(breakers, key=lambda entry: -entry["endpoint_fraction"]):
@@ -71,6 +63,7 @@ def main():
         )
     np.savez(
         breakers_path,
+        provenance=contract.artifact_provenance("measure_budget_breakers.py", staged_directory),
         **{
             f"future_{rank}": breaker["future"]
             for rank, breaker in enumerate(sorted(breakers, key=lambda entry: -entry["endpoint_fraction"]))

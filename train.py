@@ -1,4 +1,4 @@
-# > Training entry point: recipe v1 - plain AdamW, cosine rate decay to zero, no warmup, no clipping
+# > Training entry point: recipe v1 - AdamW, linear warmup then cosine rate decay to zero, gradient clipping
 # The epoch loop computes the loss components and the minADE/minFDE monitor ONLY. Weight decay
 # skips biases, LayerNorms, the learned queries and the learned anchors - parameters whose job
 # is to become or stay non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied
@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import contract, loader, loss, metrics, pipeline
+from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
 LEARNING_RATE = 1e-3
@@ -68,8 +68,12 @@ def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designat
     return steps
 
 
-def cosine_learning_rate(completed_steps, total_steps):
-    return LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * completed_steps / total_steps))
+def warmed_cosine_learning_rate(completed_steps, total_steps, warmup_steps):
+    if completed_steps < warmup_steps:
+        return LEARNING_RATE * (completed_steps + 1) / warmup_steps
+    decayed_steps = completed_steps - warmup_steps
+    decayed_total = max(total_steps - warmup_steps, 1)
+    return LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * decayed_steps / decayed_total))
 
 
 def checkpoint_state(predictor, optimizer, gradient_scaler, seed, completed_epochs, batch_index):
@@ -80,11 +84,25 @@ def checkpoint_state(predictor, optimizer, gradient_scaler, seed, completed_epoc
         "completed_epochs": completed_epochs,
         "batch_index": batch_index,
         "seed": seed,
+        "code_version": contract.STAGING_CODE_VERSION,
+        "parameter_fingerprint": model.parameter_fingerprint(
+            getattr(predictor, "_orig_mod", predictor).state_dict()
+        ),
     }
 
 
 def epochs_left_to_train(completed_epochs, requested_epochs):
     return range(completed_epochs, requested_epochs)
+
+
+def accumulate_averaged_weights(running_average, model_state, averaged_count):
+    if running_average is None:
+        return {name: tensor.detach().clone().double() for name, tensor in model_state.items()}, 1
+    for name, tensor in model_state.items():
+        running_average[name] += (tensor.detach().double() - running_average[name]) / (
+            averaged_count + 1
+        )
+    return running_average, averaged_count + 1
 
 
 def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
@@ -96,16 +114,18 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
 
 
 def train_epoch(
-    predictor, optimizer, batches, device, gradient_scaler, heading_loss_weight,
-    classification_loss_weight, neighbour_future_loss_weight, checkpoint_path, previous_checkpoint_path,
+    predictor, optimizer, batches, device, gradient_scaler,
+    heading_loss_weight, classification_loss_weight, neighbour_future_loss_weight,
+    speed_loss_weight,
+    checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
-    completed_steps_before_epoch, total_optimiser_steps,
+    completed_steps_before_epoch, total_optimiser_steps, warmup_steps, gradient_clip_norm,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
     loss_sums = {
-        "total": 0.0, "regression": 0.0, "classification": 0.0,
-        "heading": 0.0, "neighbour_future": 0.0,
+        "total": 0.0, "regression": 0.0, "heading": 0.0, "classification": 0.0,
+        "neighbour_future": 0.0, "speed": 0.0,
     }
     window_loss_sums = dict.fromkeys(loss_sums, 0.0)
     seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
@@ -115,6 +135,7 @@ def train_epoch(
     window_peak_tokens = 0
     non_finite_total_count = 0
     gradient_scaler_skip_count = 0
+    clipped_step_count = 0
     wait_start = time.perf_counter()
     checkpoint_wait_start = time.perf_counter()
     for batch in batches:
@@ -125,15 +146,15 @@ def train_epoch(
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
             (
                 trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits, reachable_distance_metres, selected_unit_anchors,
+                confidence_logits, predicted_speed, selected_unit_anchors,
                 neighbour_future_positions,
             ) = predictor.predict_with_heading(batch)
-            total, regression, classification, heading = loss.prediction_loss(
+            total, regression, heading, classification, speed = loss.prediction_loss(
                 trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits,
+                confidence_logits, predicted_speed,
                 batch["future_positions"], batch["future_headings"], batch["future_mask"],
-                selected_unit_anchors, reachable_distance_metres, heading_loss_weight,
-                classification_loss_weight,
+                selected_unit_anchors,
+                heading_loss_weight, classification_loss_weight, speed_loss_weight,
             )
             neighbour_future = loss.neighbour_future_loss(
                 neighbour_future_positions,
@@ -142,13 +163,18 @@ def train_epoch(
                 batch["neighbour_history_mask"].any(dim=-1),
             )
             total = total + neighbour_future_loss_weight * neighbour_future
-        learning_rate = cosine_learning_rate(
-            completed_steps_before_epoch + batch_count, total_optimiser_steps
+        learning_rate = warmed_cosine_learning_rate(
+            completed_steps_before_epoch + batch_count, total_optimiser_steps, warmup_steps
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
         optimizer.zero_grad()
         gradient_scaler.scale(total).backward()
+        gradient_scaler.unscale_(optimizer)
+        gradient_norm = float(torch.nn.utils.clip_grad_norm_(
+            predictor.parameters(), gradient_clip_norm
+        ))
+        clipped_step_count += int(gradient_norm > gradient_clip_norm)
         gradient_scaler.step(optimizer)
         scale_before_update = gradient_scaler.get_scale()
         gradient_scaler.update()
@@ -156,9 +182,10 @@ def train_epoch(
         component_values = {
             "total": float(total.detach()),
             "regression": float(regression.detach()),
-            "classification": float(classification.detach()),
             "heading": float(heading.detach()),
+            "classification": float(classification.detach()),
             "neighbour_future": float(neighbour_future.detach()),
+            "speed": float(speed.detach()),
         }
         for name, value in component_values.items():
             loss_sums[name] += value
@@ -207,8 +234,10 @@ def train_epoch(
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / max(window_loss_sums['regression'], 1e-12):.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
                 f"nbr/reg {neighbour_future_loss_weight * window_loss_sums['neighbour_future'] / max(window_loss_sums['regression'], 1e-12):.4f} "
+                f"spd/reg {speed_loss_weight * window_loss_sums['speed'] / max(window_loss_sums['regression'], 1e-12):.4f} "
                 f"| "
-                f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} | "
+                f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} "
+                f"clipped {clipped_step_count} | "
                 f"lr {learning_rate:.3e} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
                 f"wait {100 * seconds['data_wait'] / elapsed:.0f}% "
@@ -250,8 +279,13 @@ def main():
     parser.add_argument("--heading-loss-weight", type=float, required=True)
     parser.add_argument("--classification-loss-weight", type=float, required=True)
     parser.add_argument("--neighbour-future-loss-weight", type=float, required=True)
+    parser.add_argument("--speed-loss-weight", type=float, required=True)
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
+    parser.add_argument("--stop-after-seconds", type=float, required=True)
+    parser.add_argument("--warmup-steps", type=int, required=True)
+    parser.add_argument("--gradient-clip-norm", type=float, required=True)
+    parser.add_argument("--average-last-epochs", type=int, required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
@@ -263,6 +297,10 @@ def main():
     torch.manual_seed(arguments.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with np.load(arguments.anchors) as anchors_file:
+        contract.check_artifact_provenance(
+            anchors_file["provenance"] if "provenance" in anchors_file else None,
+            arguments.anchors, "Refit them with fit_anchors.py.",
+        )
         initial_unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
     assert initial_unit_anchors.shape == (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2), (
         f"{arguments.anchors} holds unit_anchors of shape {tuple(initial_unit_anchors.shape)},"
@@ -295,7 +333,7 @@ def main():
         resume_path = previous_checkpoint_path
         print(f"{arguments.checkpoint_path} missing, resuming from {resume_path}", flush=True)
     if arguments.resume and resume_path.exists():
-        checkpoint = torch.load(resume_path, map_location=device)
+        checkpoint = model.load_checkpoint_state(resume_path, map_location=device)
         predictor.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         if "gradient_scaler_state" in checkpoint:
@@ -326,6 +364,22 @@ def main():
     if arguments.compile:
         predictor = torch.compile(predictor, dynamic=True)
 
+    training_start = time.perf_counter()
+    averaged_weights = None
+    averaged_epoch_count = 0
+    averaged_checkpoint_path = arguments.checkpoint_path.with_name(
+        arguments.checkpoint_path.stem + "_averaged" + arguments.checkpoint_path.suffix
+    )
+    first_averaged_epoch = arguments.epochs - arguments.average_last_epochs
+    if completed_epochs > first_averaged_epoch:
+        print(
+            f"AVERAGING WINDOW TRUNCATED BY RESUME: --average-last-epochs asked for"
+            f" {arguments.average_last_epochs} epochs from epoch {first_averaged_epoch + 1}, but"
+            f" this process starts at epoch {completed_epochs + 1}, so {averaged_checkpoint_path}"
+            f" will average only the {arguments.epochs - completed_epochs} epochs this process"
+            f" trains.",
+            flush=True,
+        )
     for epoch_index in remaining_epochs:
         batches = pipeline.batches(
             scenario_paths, arguments.workers, arguments.batch_size,
@@ -333,18 +387,21 @@ def main():
             not arguments.all_eligible_agents,
         )
         averages, monitor, seconds = train_epoch(
-            predictor, optimizer, batches, device, gradient_scaler, arguments.heading_loss_weight,
-            arguments.classification_loss_weight, arguments.neighbour_future_loss_weight,
+            predictor, optimizer, batches, device, gradient_scaler,
+            arguments.heading_loss_weight, arguments.classification_loss_weight,
+            arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             epoch_index * steps_per_epoch, total_optimiser_steps,
+            arguments.warmup_steps, arguments.gradient_clip_norm,
         )
         print(
             f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
-            f" + cls {averages['classification']:.4f}"
             f" + hdg {averages['heading']:.4f}"
+            f" + cls {averages['classification']:.4f}"
             f" + nbr {averages['neighbour_future']:.4f}"
+            f" + spd {averages['speed']:.4f}"
             f") | "
             f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
             f"kept modes {monitor['mean_kept_modes']:.2f}"
@@ -360,10 +417,36 @@ def main():
                 flush=True,
             )
             continue
-        save_checkpoint(
-            arguments.checkpoint_path, previous_checkpoint_path,
-            checkpoint_state(predictor, optimizer, gradient_scaler, arguments.seed, epoch_index + 1, None),
+        epoch_state = checkpoint_state(
+            predictor, optimizer, gradient_scaler, arguments.seed, epoch_index + 1, None
         )
+        save_checkpoint(arguments.checkpoint_path, previous_checkpoint_path, epoch_state)
+        if epoch_index + 1 > arguments.epochs - arguments.average_last_epochs:
+            averaged_weights, averaged_epoch_count = accumulate_averaged_weights(
+                averaged_weights, epoch_state["model_state"], averaged_epoch_count
+            )
+            averaged_state = dict(epoch_state)
+            averaged_state["model_state"] = {
+                name: tensor.to(epoch_state["model_state"][name].dtype)
+                for name, tensor in averaged_weights.items()
+            }
+            torch.save(averaged_state, averaged_checkpoint_path)
+            print(
+                f"averaged the last {averaged_epoch_count} epoch checkpoints into"
+                f" {averaged_checkpoint_path}",
+                flush=True,
+            )
+        elapsed_seconds = time.perf_counter() - training_start
+        if elapsed_seconds >= arguments.stop_after_seconds:
+            print(
+                f"STOPPING EARLY: {elapsed_seconds / 3600:.2f} h elapsed against a"
+                f" --stop-after-seconds budget of {arguments.stop_after_seconds / 3600:.2f} h."
+                f" {epoch_index + 1} of {arguments.epochs} epochs are complete and"
+                f" {arguments.checkpoint_path} holds them. The cosine schedule was built for"
+                f" {arguments.epochs} epochs, so the learning rate did NOT finish annealing.",
+                flush=True,
+            )
+            return
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 from womd import store, tfrecord
-from waymo_open_dataset.protos import scenario_pb2
+from womd_protos import scenario_pb2
 
 # One shard (about 300-600 scenarios) -> its .npz files. Streams scenarios off disk one at a time
 # (never loads the shard whole), writes <scenario_id>.npz into output_directory. Returns every

@@ -89,9 +89,13 @@
     ],
     "dtype": "float32"
   },
+  "provenance": {
+    "shape": [],
+    "dtype": "str"
+  },
   "scenario_id": {
     "shape": [],
-    "dtype": "<U8"
+    "dtype": "str"
   },
   "stop_sign_controlled_lanes": {
     "shape": [

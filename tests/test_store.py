@@ -1,7 +1,7 @@
 import numpy as np
 
 from womd import contract, store
-from waymo_open_dataset.protos import map_pb2, scenario_pb2
+from womd_protos import map_pb2, scenario_pb2
 
 WORLD_ORIGIN = np.zeros(2)
 WORLD_HEADING = 0.0

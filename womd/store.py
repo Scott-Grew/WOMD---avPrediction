@@ -6,7 +6,7 @@ import numpy as np
 
 from womd import contract
 from womd import frame_ops
-from waymo_open_dataset.protos import map_pb2, scenario_pb2
+from womd_protos import map_pb2, scenario_pb2
 
 ####    ------------------------------------------------------------- < AGENTS >
 # Reads two facts: where the self-driving car (sdc) is and which way it faces, at the "now" step, in world coordinates
@@ -607,6 +607,7 @@ def write_scenario(scenario, output_path):
             frame_origin=origin.astype(np.float32),
             frame_heading=np.float32(heading),
             scenario_id=scenario.scenario_id,
+            provenance=contract.artifact_provenance("stage.py", scenario.scenario_id),
         )
     partial_path.replace(output_path)
     return worst_spacing_deviation

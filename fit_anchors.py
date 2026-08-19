@@ -11,7 +11,7 @@ from womd import contract, loader, model
 MAXIMUM_ITERATIONS = 2000
 
 
-def budget_fraction_endpoints(scenario_paths):
+def metre_endpoints(scenario_paths):
     agent_histories = []
     logged_endpoints = []
     for scenario_path in scenario_paths:
@@ -33,8 +33,9 @@ def budget_fraction_endpoints(scenario_paths):
     agent_history = torch.from_numpy(np.stack(agent_histories))
     endpoints = torch.from_numpy(np.stack(logged_endpoints))
     return (
-        endpoints / model.agent_reachable_distance(agent_history)[:, None],
+        endpoints,
         model.predicted_type_index(agent_history),
+        model.agent_reachable_distance(agent_history),
     )
 
 
@@ -71,7 +72,8 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
 
 
 def fit_unit_anchors(endpoints):
-    centres = model.unit_anchor_offsets()
+    seed_scale = float(endpoints.norm(dim=-1).max())
+    centres = model.unit_anchor_offsets() * seed_scale
     initial_assignment = torch.cdist(endpoints, centres).argmin(dim=1)
     assignment = initial_assignment
     for iteration_count in range(1, MAXIMUM_ITERATIONS + 1):
@@ -92,7 +94,7 @@ def minimum_pairwise_distance(anchors):
 
 def print_one_type(
     type_name, type_sample_count, fitted_anchors, fitted_counts, fan_counts,
-    iteration_count, stopped_by_convergence,
+    seed_scale, iteration_count, stopped_by_convergence,
 ):
     print(
         f"{type_name} | samples {type_sample_count} | k-means ran {iteration_count} iterations,"
@@ -119,7 +121,7 @@ def print_one_type(
     )
     print(
         f"{'minimum pairwise distance':<28}"
-        f"{minimum_pairwise_distance(model.unit_anchor_offsets()):>16.3f}"
+        f"{minimum_pairwise_distance(model.unit_anchor_offsets() * seed_scale):>16.3f}"
         f"{minimum_pairwise_distance(fitted_anchors):>12.3f}"
     )
     print()
@@ -131,23 +133,39 @@ def main():
     endpoints_cache_path = staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
 
     start_seconds = time.perf_counter()
+    cached_arrays = None
     if endpoints_cache_path.exists():
         with np.load(endpoints_cache_path) as endpoints_cache:
-            endpoints = torch.from_numpy(endpoints_cache["endpoints"])
-            predicted_type_index = torch.from_numpy(endpoints_cache["predicted_type_index"])
+            cache_provenance = (
+                endpoints_cache["provenance"] if "provenance" in endpoints_cache else None
+            )
+            try:
+                contract.check_artifact_provenance(
+                    cache_provenance, endpoints_cache_path, "Re-extracting endpoints now."
+                )
+                cached_arrays = {name: endpoints_cache[name] for name in
+                                 ("endpoints", "predicted_type_index", "reachable_distance_metres")}
+            except AssertionError as refusal:
+                print(refusal)
+    if cached_arrays is not None:
+        endpoints = torch.from_numpy(cached_arrays["endpoints"])
+        predicted_type_index = torch.from_numpy(cached_arrays["predicted_type_index"])
+        reachable_distance_metres = torch.from_numpy(cached_arrays["reachable_distance_metres"])
         print(f"endpoints read from {endpoints_cache_path}")
     else:
         scenario_paths = sorted(staged_directory.glob("*.npz"))
-        endpoints, predicted_type_index = budget_fraction_endpoints(scenario_paths)
+        endpoints, predicted_type_index, reachable_distance_metres = metre_endpoints(scenario_paths)
         np.savez(
             endpoints_cache_path,
             endpoints=endpoints.numpy().astype(np.float32),
             predicted_type_index=predicted_type_index.numpy().astype(np.int64),
+            reachable_distance_metres=reachable_distance_metres.numpy().astype(np.float32),
+            provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
         )
         print(f"endpoints cached to {endpoints_cache_path}")
     elapsed_seconds = time.perf_counter() - start_seconds
 
-    physically_reachable = endpoints.norm(dim=-1) <= 1.0
+    physically_reachable = endpoints.norm(dim=-1) <= reachable_distance_metres
     excluded_count = int((~physically_reachable).sum())
     endpoints = endpoints[physically_reachable]
     predicted_type_index = predicted_type_index[physically_reachable]
@@ -198,11 +216,15 @@ def main():
         print_one_type(
             type_name, type_endpoints.shape[0], fitted_anchors, fitted_counts[share_order],
             endpoints_per_centre(initial_assignment, model.QUERY_COUNT),
-            iteration_count, stopped_by_convergence,
+            float(type_endpoints.norm(dim=-1).max()), iteration_count, stopped_by_convergence,
         )
 
     unit_anchors = torch.stack(fitted_anchors_per_type)
-    np.savez(output_path, unit_anchors=unit_anchors.numpy().astype(np.float32))
+    np.savez(
+        output_path,
+        unit_anchors=unit_anchors.numpy().astype(np.float32),
+        provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
+    )
     print(
         f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)},"
         f" one set per {contract.PREDICTED_OBJECT_TYPES} in that order, most-used anchor first"

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from womd import contract, pipeline
-from womd.model import MotionPredictor
+from womd.model import MotionPredictor, load_checkpoint_state
 
 BATCH_SIZE = 32
 FIXED_SEED = 0
@@ -125,13 +125,6 @@ def perturbation_targets(batch):
         "map_dot_polyline_slot": PerturbationTarget("map_dot_polyline_slot", 0, every_map_dot),
         "map_chunk_signal_history": PerturbationTarget("map_chunk_signal_history", 2, present_chunks),
         "map_chunk_lane_context": PerturbationTarget("map_chunk_lane_context", 1, present_chunks),
-        "agent_signal_history": PerturbationTarget(
-            "agent_signal_history", 2,
-            torch.ones(batch["agent_signal_history"].shape[0], dtype=torch.bool),
-        ),
-        "neighbour_signal_history": PerturbationTarget(
-            "neighbour_signal_history", 2, batch["neighbour_history_mask"].any(dim=-1).reshape(-1)
-        ),
     }
 
 
@@ -215,8 +208,6 @@ def build_perturbations(batch, targets, random_generator):
         ("agent_history_mask", contract.HISTORY_STEPS),
         ("neighbour_history_mask", contract.HISTORY_STEPS),
         ("map_chunk_signal_history", contract.POLYLINE_SIGNAL_DIM),
-        ("agent_signal_history", contract.POLYLINE_SIGNAL_DIM),
-        ("neighbour_signal_history", contract.POLYLINE_SIGNAL_DIM),
     ):
         for perturbation_kind in ("zero", "shuffle"):
             perturbations.append((
@@ -291,13 +282,18 @@ def main():
     )
 
     torch.manual_seed(FIXED_SEED)
-    unit_anchors = torch.from_numpy(np.load(anchors_path)["unit_anchors"]).float()
+    with np.load(anchors_path) as anchors_file:
+        contract.check_artifact_provenance(
+            anchors_file["provenance"] if "provenance" in anchors_file else None,
+            anchors_path, "Refit them with fit_anchors.py.",
+        )
+        unit_anchors = torch.from_numpy(anchors_file["unit_anchors"]).float()
     predictor = MotionPredictor(unit_anchors)
     if checkpoint_path is None:
         print("UNTRAINED WORKING-TREE MODEL: the numbers below are meaningless and this run only"
               " proves every perturbation still builds and still moves its tensor.")
     else:
-        predictor.load_state_dict(torch.load(checkpoint_path, map_location="cpu")["model_state"])
+        predictor.load_state_dict(load_checkpoint_state(checkpoint_path)["model_state"])
     predictor.eval()
 
     scenario_paths = sorted(staged_directory.glob("*.npz"))

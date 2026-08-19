@@ -1,12 +1,14 @@
 # > The model: one agent's view of the scene in, six possible 8 s futures out
 # Every encoder outputs HIDDEN_DIM-wide embeddings; attention runs at that width.
 
+import hashlib
+
 import torch
 from torch import nn
 
 from womd import contract
 
-HIDDEN_DIM = 128
+HIDDEN_DIM = 256
 
 
 # One divisor per feature column, applied before each encoder's first Linear. Every distance-like
@@ -260,33 +262,6 @@ def agent_reachable_distance(agent_history):
     )
 
 
-# QUERY_COUNT learned queries, each a standing question the model owns, and each owning one anchor
-# PER PREDICTED OBJECT TYPE - the territory it is assigned logged futures from, starting at the
-# contract.NUM_OBJECT_TYPES anchor sets the constructor is handed and free to move. A walking
-# pedestrian's plausible futures look nothing like a car's and a cyclist's are a third thing, so
-# each type is fitted its own set and a sample is handed its own type's, selected from the type
-# one-hot on its "now" row. There is no default: which futures each mode is assigned is a modelling
-# claim, so a caller states where its anchors come from rather than inheriting one from this file.
-# The selected anchor is added to the query so the mode knows which territory it holds, and again to
-# the curve, ramped over the horizon so it arrives in full at the endpoint and leaves the origin
-# start untouched, so the anchor sits in the output and is pulled by the regression term of the
-# mode it was assigned to. That second addition is in METRES, at unit_anchor * reachable_distance -
-# the endpoint loss.anchor_assigned_mode assigns logged futures by and the one
-# baseline.straight_lines_to_most_used_anchors drives to - so one definition of an anchor holds in
-# all four places. forward RETURNS the per-sample selected anchors and the loss is handed that same
-# tensor rather than re-selecting, so the decoder and the assignment cannot disagree about which set
-# a sample got. The anchors are read raw - no projection, no clamp: the field bounds no output
-# coordinate, and the fit excludes physically impossible endpoints, so the table holds only
-# destinations real agents reached.
-# Each query cross-attends over the scene tokens and a
-# SHARED head writes its trajectory + confidence - modes differ by their query vector and by their
-# anchor, so query count is a config number. The head writes TRAJECTORY_CONTROL_POINTS position
-# pairs, TRAJECTORY_CONTROL_POINTS heading pairs and TRAJECTORY_CONTROL_POINTS log-standard-deviation
-# pairs, which the same Bernstein basis evaluates into the contract.FUTURE_STEPS positions in metres,
-# the contract.FUTURE_STEPS heading cosine/sine pairs - a pair per step rather than an angle, so
-# nothing downstream has to wrap - and the contract.FUTURE_STEPS per-axis log standard deviations the
-# regression term reads. Nothing rescales or squashes a predicted coordinate; the one clamp is on the
-# log standard deviation, at MTR's shipped range.
 class ModeDecoder(nn.Module):
     def __init__(self, initial_unit_anchors):
         super().__init__()
@@ -328,11 +303,11 @@ class ModeDecoder(nn.Module):
     def unit_anchors(self):
         return self.anchor_offsets
 
-    def forward(self, tokens, token_present, reachable_distance_metres, predicted_type_index):
-        batch_size = tokens.shape[0]
-        selected_unit_anchors = self.unit_anchors[predicted_type_index]
-        queries = self.queries + self.anchor_projection(selected_unit_anchors)
-        read = queries + self.cross_attention(queries, self.scene_norm(tokens), token_present)
+    def decode_from_anchors(self, normed_tokens, token_present, unit_anchors, batch_size):
+        queries = self.queries + self.anchor_projection(
+            unit_anchors / contract.DISTANCE_NORMALISER_METRES
+        )
+        read = queries + self.cross_attention(queries, normed_tokens, token_present)
         head_output = self.trajectory_head(read)
         control_points = head_output[..., :POSITION_CONTROL_VALUES].view(
             batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2
@@ -348,14 +323,32 @@ class ModeDecoder(nn.Module):
             self.curve_basis, log_standard_deviation_control_points
         ).clamp(MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION)
         confidence_logits = self.confidence_head(read).squeeze(-1)
-        anchor_endpoints = selected_unit_anchors * reachable_distance_metres[:, None, None]
         anchored_position = (
             torch.matmul(self.curve_basis, control_points)
-            + anchor_endpoints[:, :, None, :] * self.anchor_ramp[None, None, :, None]
+            + unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
         )
+        emitted_step_positions = torch.cat(
+            [torch.zeros_like(anchored_position[..., :1, :]), anchored_position], dim=-2
+        )
+        predicted_speed = emitted_step_positions.diff(dim=-2).norm(
+            dim=-1
+        ) / contract.TIMESTEP_SECONDS
         return (
             anchored_position, heading_cosine_sine, position_log_standard_deviation,
-            confidence_logits, selected_unit_anchors,
+            confidence_logits, predicted_speed,
+        )
+
+    def forward(self, tokens, token_present, predicted_type_index):
+        batch_size = tokens.shape[0]
+        normed_tokens = self.scene_norm(tokens)
+        selected_unit_anchors = self.unit_anchors[predicted_type_index]
+        (
+            anchored_position, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, predicted_speed,
+        ) = self.decode_from_anchors(normed_tokens, token_present, selected_unit_anchors, batch_size)
+        return (
+            anchored_position, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, predicted_speed, selected_unit_anchors,
         )
 
 
@@ -461,17 +454,15 @@ class NeighbourFutureHead(nn.Module):
         return positions.view(*neighbour_tokens.shape[:2], contract.FUTURE_STEPS, 2)
 
 
-# Training reads all QUERY_COUNT modes; prune_modes runs only at evaluation/submission. forward keeps the
-# (trajectories in metres, confidence logits) pair the metric accumulator, the null baselines and
-# the submission path all speak, and pays for nothing else; the auxiliary heading and the neighbour
-# futures are training-only outputs and are reached through predict_with_heading, which the epoch
-# loop calls instead.
 class MotionPredictor(nn.Module):
     def __init__(self, initial_unit_anchors):
         super().__init__()
         self.scene_encoder = SceneEncoder()
         self.mode_decoder = ModeDecoder(initial_unit_anchors)
         self.neighbour_future_head = NeighbourFutureHead()
+        self.neighbour_future_feedback_projection = nn.Linear(
+            2 * contract.FUTURE_STEPS, HIDDEN_DIM, bias=False
+        )
 
     @property
     def unit_anchors(self):
@@ -479,28 +470,66 @@ class MotionPredictor(nn.Module):
 
     def encode_scene_and_modes(self, batch):
         tokens, token_present = self.scene_encoder(batch)
-        reachable_distance_metres = agent_reachable_distance(batch["agent_history"])
+        neighbour_count = batch["neighbour_history"].shape[1]
+        neighbour_tokens = tokens[:, 1:1 + neighbour_count]
+        neighbour_present = token_present[:, 1:1 + neighbour_count]
+        neighbour_future_positions = self.neighbour_future_head(neighbour_tokens)
+        neighbour_feedback = self.neighbour_future_feedback_projection(
+            (neighbour_future_positions / contract.DISTANCE_NORMALISER_METRES).flatten(start_dim=-2)
+        )
+        neighbour_feedback = (
+            neighbour_feedback * neighbour_present.unsqueeze(-1).to(neighbour_feedback.dtype)
+        )
+        tokens = torch.cat(
+            [tokens[:, :1], neighbour_tokens + neighbour_feedback, tokens[:, 1 + neighbour_count:]],
+            dim=1,
+        )
         (
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-            selected_unit_anchors,
+            predicted_speed, selected_unit_anchors,
         ) = self.mode_decoder(
-            tokens, token_present, reachable_distance_metres,
-            predicted_type_index(batch["agent_history"]),
+            tokens, token_present, predicted_type_index(batch["agent_history"]),
         )
         return (tokens, trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits, reachable_distance_metres, selected_unit_anchors)
+                confidence_logits, predicted_speed, selected_unit_anchors, neighbour_future_positions)
 
     def predict_with_heading(self, batch):
         (
-            tokens, trajectories, heading_cosine_sine, position_log_standard_deviation,
-            confidence_logits, reachable_distance_metres, selected_unit_anchors,
+            _, trajectories, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, predicted_speed, selected_unit_anchors, neighbour_future_positions,
         ) = self.encode_scene_and_modes(batch)
-        neighbour_count = batch["neighbour_history"].shape[1]
-        neighbour_future_positions = self.neighbour_future_head(tokens[:, 1:1 + neighbour_count])
         return (trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits, reachable_distance_metres, selected_unit_anchors,
-                neighbour_future_positions)
+                confidence_logits, predicted_speed, selected_unit_anchors, neighbour_future_positions)
 
     def forward(self, batch):
-        _, trajectories, _, _, confidence_logits, _, _ = self.encode_scene_and_modes(batch)
+        _, trajectories, _, _, confidence_logits, _, _, _ = self.encode_scene_and_modes(batch)
         return trajectories, confidence_logits
+
+
+def parameter_fingerprint(model_state):
+    parameter_description = ",".join(
+        f"{name}:{tuple(tensor.shape)}" for name, tensor in sorted(model_state.items())
+    )
+    return hashlib.sha256(parameter_description.encode()).hexdigest()
+
+
+def load_checkpoint_state(checkpoint_path, map_location="cpu", allow_version_mismatch=False):
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    checkpoint_code_version = checkpoint.get("code_version")
+    if not allow_version_mismatch:
+        assert checkpoint_code_version == contract.STAGING_CODE_VERSION, (
+            f"{checkpoint_path} was saved under code_version {checkpoint_code_version!r}, but the"
+            f" working tree is at contract.STAGING_CODE_VERSION {contract.STAGING_CODE_VERSION!r}."
+            f" Loading it with strict=True would silently accept a byte-compatible but"
+            f" architecturally different state dict. Pass allow_version_mismatch=True to load it"
+            f" anyway."
+        )
+    stamped_fingerprint = checkpoint.get("parameter_fingerprint")
+    if stamped_fingerprint is not None:
+        recomputed_fingerprint = parameter_fingerprint(checkpoint["model_state"])
+        assert stamped_fingerprint == recomputed_fingerprint, (
+            f"{checkpoint_path} carries parameter_fingerprint {stamped_fingerprint} but its"
+            f" model_state hashes to {recomputed_fingerprint}: the state dict was altered after"
+            f" the stamp was written."
+        )
+    return checkpoint

@@ -5,25 +5,25 @@
 # loader's speed-stretched crop reaches from the self-driving car, and how many of the map dots
 # that crop wants survive a staging radius of 150/200/250/300/400 m. Reports how much map
 # Waymo's own scenario extent supplies at 100-500 m, so a larger radius can be judged against
-# what is actually there. Reports what resampling the same polylines at 1.0 m instead of 0.5 m
-# costs: dots per scenario, dots inside a target's crop, and the distance from each dropped dot
-# to the coarser polyline that replaces it.
+# what is actually there. Reports what resampling the same polylines at --coarse-spacing-metres
+# instead of --fine-spacing-metres costs: dots per scenario, dots inside a target's crop, and the
+# distance from each dropped dot to the coarser polyline that replaces it.
 # Crop reach is the maximum distance from the self-driving car reached by any point of the crop
 # region, taken over CROP_BOUNDARY_SAMPLES points on its boundary; the region is convex, so its
 # farthest point from an outside origin lies on that boundary.
 # Reports only - no constant is chosen, derived or written anywhere here.
-# Run: python3 measure_staging.py ../data/validation.tfrecord-00000-of-00150
+# Run: python3 measure_staging.py ../data/validation_raw/validation.tfrecord-00000-of-00150 --fine-spacing-metres
+# 0.5 --coarse-spacing-metres 1.0
 
-import sys
+import argparse
 import time
 from pathlib import Path
 
 import numpy as np
 
 from womd import contract, frame_ops, loader, store, tfrecord
-from waymo_open_dataset.protos import scenario_pb2
+from womd_protos import scenario_pb2
 
-COARSE_SPACING_METRES = 1.0
 STAGING_RADIUS_PROBES = (150.0, 200.0, 250.0, 300.0, 400.0)
 MAP_EXTENT_RADII_METRES = (100.0, 150.0, 200.0, 250.0, 300.0, 400.0, 500.0)
 CROP_BOUNDARY_SAMPLES = 2048
@@ -84,7 +84,7 @@ def dropped_dot_deviations(fine_points, coarse_points):
     return deviations
 
 
-def scenario_map_geometry(scenario, origin, heading):
+def scenario_map_geometry(scenario, origin, heading, fine_spacing_metres, coarse_spacing_metres):
     fine_blocks = []
     coarse_blocks = []
     deviation_blocks = []
@@ -92,8 +92,8 @@ def scenario_map_geometry(scenario, origin, heading):
         raw_points = store.map_feature_points(feature)[0]
         if raw_points is None:
             continue
-        fine_points = store.points_along_polyline(raw_points, contract.MAP_POINT_SPACING_METRES)
-        coarse_points = store.points_along_polyline(raw_points, COARSE_SPACING_METRES)
+        fine_points = store.points_along_polyline(raw_points, fine_spacing_metres)
+        coarse_points = store.points_along_polyline(raw_points, coarse_spacing_metres)
         fine_blocks.append(frame_ops.positions_to_agent_frame(fine_points, origin, heading))
         coarse_blocks.append(frame_ops.positions_to_agent_frame(coarse_points, origin, heading))
         deviation_blocks.append(dropped_dot_deviations(fine_points, coarse_points))
@@ -124,11 +124,19 @@ def distribution_row(label, values, exceeded_radius):
 
 
 def main():
-    shard_path = Path(sys.argv[1])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("shard_path", type=Path)
+    parser.add_argument("--fine-spacing-metres", type=float, required=True)
+    parser.add_argument("--coarse-spacing-metres", type=float, required=True)
+    arguments = parser.parse_args()
+    shard_path = arguments.shard_path
+    fine_spacing_metres = arguments.fine_spacing_metres
+    coarse_spacing_metres = arguments.coarse_spacing_metres
+
     tallies = {name: PopulationTallies() for name in POPULATION_NAMES}
     map_dots_within_radius = {radius: [] for radius in MAP_EXTENT_RADII_METRES}
     map_extent_maxima = []
-    spacings = (contract.MAP_POINT_SPACING_METRES, COARSE_SPACING_METRES)
+    spacings = (fine_spacing_metres, coarse_spacing_metres)
     dots_per_scenario = {spacing: [] for spacing in spacings}
     crop_dots_per_target = {spacing: [] for spacing in spacings}
     staged_crop_dots_per_target = {spacing: [] for spacing in spacings}
@@ -144,11 +152,11 @@ def main():
         track_rows, track_valid = store.scenario_track_arrays(scenario)
         is_designated_target = store.scenario_track_labels(scenario)[1]
         fine_map_positions, coarse_map_positions, feature_deviations = scenario_map_geometry(
-            scenario, origin, heading
+            scenario, origin, heading, fine_spacing_metres, coarse_spacing_metres
         )
         deviation_blocks.append(feature_deviations)
-        dots_per_scenario[contract.MAP_POINT_SPACING_METRES].append(len(fine_map_positions))
-        dots_per_scenario[COARSE_SPACING_METRES].append(len(coarse_map_positions))
+        dots_per_scenario[fine_spacing_metres].append(len(fine_map_positions))
+        dots_per_scenario[coarse_spacing_metres].append(len(coarse_map_positions))
 
         fine_map_distances = np.linalg.norm(fine_map_positions, axis=1)
         coarse_map_distances = np.linalg.norm(coarse_map_positions, axis=1)
@@ -208,12 +216,12 @@ def main():
                 coarse_agent_frame_map, loader.BASE_RADIUS_METRES, forward_stretch
             )
             coarse_wanted_distances = coarse_map_distances[coarse_wanted]
-            crop_dots_per_target[contract.MAP_POINT_SPACING_METRES].append(fine_wanted_distances.size)
-            crop_dots_per_target[COARSE_SPACING_METRES].append(coarse_wanted_distances.size)
-            staged_crop_dots_per_target[contract.MAP_POINT_SPACING_METRES].append(
+            crop_dots_per_target[fine_spacing_metres].append(fine_wanted_distances.size)
+            crop_dots_per_target[coarse_spacing_metres].append(coarse_wanted_distances.size)
+            staged_crop_dots_per_target[fine_spacing_metres].append(
                 int(np.count_nonzero(fine_wanted_distances <= contract.STAGING_CROP_RADIUS_METRES))
             )
-            staged_crop_dots_per_target[COARSE_SPACING_METRES].append(
+            staged_crop_dots_per_target[coarse_spacing_metres].append(
                 int(np.count_nonzero(coarse_wanted_distances <= contract.STAGING_CROP_RADIUS_METRES))
             )
     elapsed_seconds = time.perf_counter() - start_seconds
@@ -266,7 +274,7 @@ def main():
     print()
 
     print(f"map dots Waymo's own scenario extent supplies, per scenario, "
-          f"{contract.MAP_POINT_SPACING_METRES} m spacing")
+          f"{fine_spacing_metres} m spacing")
     print(f"{'radius':>8}{'dots p50':>11}{'dots mean':>12}{'share of 500 m':>16}")
     dots_within_500 = np.mean(map_dots_within_radius[MAP_EXTENT_RADII_METRES[-1]])
     for radius in MAP_EXTENT_RADII_METRES:
@@ -291,7 +299,7 @@ def main():
               f"{crop_counts.max():>9}"
               f"{np.percentile(staged_crop_counts, 50):>28.0f}"
               f"{np.percentile(staged_crop_counts, 90):>9.0f}{staged_crop_counts.max():>9}")
-    print(f"dropped dots {all_deviations.size} | distance to the {COARSE_SPACING_METRES} m polyline "
+    print(f"dropped dots {all_deviations.size} | distance to the {coarse_spacing_metres} m polyline "
           f"that replaces them: p50 {np.percentile(all_deviations, 50):.4f} m | "
           f"p99 {np.percentile(all_deviations, 99):.4f} m | max {all_deviations.max():.4f} m")
 

@@ -17,6 +17,12 @@ from womd import contract
 from womd.model import prune_modes_batched_with_kept_count
 
 
+def mean_distance_per_mode(trajectories, future_positions, future_mask):
+    step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
+    validity = future_mask.unsqueeze(1).to(step_distances.dtype)
+    return (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
+
+
 class MetricAccumulator:
     def __init__(self):
         self.ade_sum = 0.0

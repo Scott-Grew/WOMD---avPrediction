@@ -14,11 +14,11 @@ PREDICTED_OBJECT_TYPES = ("TYPE_VEHICLE", "TYPE_PEDESTRIAN", "TYPE_CYCLIST")    
 NUM_OBJECT_TYPES = len(PREDICTED_OBJECT_TYPES)
 AGENT_TYPES = PREDICTED_OBJECT_TYPES + ("TYPE_OTHER",)
 NUM_AGENT_TYPES = len(AGENT_TYPES)
-STAGING_CROP_RADIUS_METRES = 400.0              # Scott 2026-08-14. measure_staging.py on validation.tfrecord-00000-of-00150, 287 scenarios: designated targets lose 3.0% of wanted map dots at 250 m (worst target 46.6%), 0.1% at 400 m; storage +4.2% vs 250 m because Waymo's own map ends at a median of 192.7 m and 99.9% of all dots within 500 m already sit inside 400 m.
+STAGING_CROP_RADIUS_METRES = 400.0              # Scott 2026-08-14. measure_staging.py on validation_raw/validation.tfrecord-00000-of-00150, 287 scenarios: designated targets lose 3.0% of wanted map dots at 250 m (worst target 46.6%), 0.1% at 400 m; storage +4.2% vs 250 m because Waymo's own map ends at a median of 192.7 m and 99.9% of all dots within 500 m already sit inside 400 m.
 MAP_POINT_SPACING_METRES = 1.0                  # Scott 2026-08-14, was 0.5. Halves staged bytes, per-sample cost and read bandwidth. Geometry cost, measure_staging.py over 3,564,503 dropped dots: p50 0.0000 m, p99 0.138 m, max 0.495 m. Model cost measured directly on the polyline tokens the attention actually reads, 4,054 tokens over 25 scenarios: cosine similarity p50 1.00000 / p5 0.99965, relative change p50 0.0005 / p95 0.0266; uncorrelated with polyline length (r = 0.007); lanes 0.0003, road lines 0.0001, stop signs 0.0000, and the change concentrates on polygon kinds (speed bump 0.031, driveway 0.016, crosswalk 0.015) whose corners are what alternate-dot dropping costs.
 MAP_CHUNK_DOTS = 20                             # Scott 2026-08-14: a map token is at most 20 consecutive dots of one polyline, not one token per whole polyline. Measured over four DISJOINT 40-scenario blocks of ../data/staged (400 m, 1.0 m spacing, ALL designated targets): tokens/sample 189->450, 209->488, 215->520, 234->528, i.e. a stable 2.25-2.41x, and every token capped at 20 dots = 20 m against p90 75 m unchunked. Attention measured 6.1% of total epoch time on a Kaggle T4 (profile_step.py) so the token growth is affordable. An earlier 178->426 pair recorded here came from sampling only the FIRST target per scenario and does not reproduce; it is superseded by the four blocks above.
 NUM_PREDICTED_MODES = 6                         # Mode = possible future. We predict X futures. WOMD caps submissions at 6. Prune from X.
-STAGING_CODE_VERSION = "2026-08-16-a"           # Bumped by hand on every code-dataset upload. kaggle_preflight compares working copy vs mount.
+STAGING_CODE_VERSION = "2026-08-19-a"           # Bumped by hand on every code-dataset upload. kaggle_preflight compares working copy vs mount.
 
 # > SUBMISSION FORMAT. DICTATED BY waymo_open_dataset/protos/motion_submission.proto, READ 2026-08-14.
 SUBMISSION_STEPS = 16                           # motion_submission.proto, read 2026-08-14: "these fields must be exactly length 16 - 8 seconds with 2 steps per second".
@@ -87,7 +87,7 @@ MAP_POSITION = slice(0, 2)
 MAP_DIRECTION = slice(2, 4)
 MAP_KIND = slice(4, 4 + NUM_MAP_POLYLINE_KINDS)
 MAP_FEATURE_DIM = MAP_KIND.stop
-POLYLINE_SIGNAL_DIM = HISTORY_STEPS * NUM_TRAFFIC_SIGNAL_STATES   # Scott 2026-08-14: a traffic-signal history belongs to a LANE, so it is stored once per polyline and attached after pooling, at the chunk token; it used to be 99 of the 129 per-dot columns, repeated identically on every dot of the lane (median ~20-26 dots per polyline). Measured cost of the repeat: measure_compression.py on 287 scenarios of ../data/staged, 2026-08-14, map_rows = 81.2% of compressed and 95.0% of uncompressed bytes; profile_step.py on a Kaggle T4, 2026-08-14, .npz decompression = 28.8% of total pipeline time, more than the model's forward plus backward.
+POLYLINE_SIGNAL_DIM = HISTORY_STEPS * NUM_TRAFFIC_SIGNAL_STATES   # Scott 2026-08-14: a traffic-signal history belongs to a LANE, so it is stored once per polyline and attached after pooling, at the chunk token; it used to be 99 of the 129 per-dot columns, repeated identically on every dot of the lane (median ~20-26 dots per polyline). Measured cost of the repeat: measure_compression.py (retired to STATUS §MEASUREMENT SCRIPTS) on 287 scenarios of ../data/staged, 2026-08-14, map_rows = 81.2% of compressed and 95.0% of uncompressed bytes; profile_step.py on a Kaggle T4, 2026-08-14, .npz decompression = 28.8% of total pipeline time, more than the model's forward plus backward.
 
 LANE_TYPES = (
     "TYPE_UNDEFINED",
@@ -178,3 +178,34 @@ LANE_CONTEXT_AGENT_LANE_DISTANCE = 2            # Scott 2026-08-15, replacing a 
 LANE_CONTEXT_HAS_STOP_SIGN = 3
 LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE = 4
 LANE_CONTEXT_DIM = 5
+
+# > ARTIFACT PROVENANCE. Set 2026-08-19 after two incidents the same week: training_anchors.npz
+# silently overwritten by a refit under a different scheme (a control read 426 m against its
+# recorded 5.98 m), and a stale endpoints cache whose format no longer matched the code that
+# reads it. Every artifact this codebase WRITES carries a stamp naming the code version that
+# produced it, the script that wrote it, and the data it came from; every reader hands the stamp
+# to check_artifact_provenance, which refuses a mismatch instead of computing on it. A file
+# without a stamp predates the contract and is refused by default for the same reason - what
+# produced it is unrecorded, so nothing can vouch for it.
+def artifact_provenance(producer, source):
+    import json
+    return json.dumps({
+        "code_version": STAGING_CODE_VERSION,
+        "producer": producer,
+        "source": str(source),
+    })
+
+
+def check_artifact_provenance(stored_provenance, artifact_path, regenerate_hint):
+    import json
+    assert stored_provenance is not None, (
+        f"{artifact_path} carries no provenance stamp, so what produced it is unrecorded."
+        f" {regenerate_hint}"
+    )
+    provenance = json.loads(str(stored_provenance))
+    assert provenance["code_version"] == STAGING_CODE_VERSION, (
+        f"{artifact_path} was produced under code_version {provenance['code_version']!r}"
+        f" by {provenance['producer']} from {provenance['source']}, but the working tree is at"
+        f" {STAGING_CODE_VERSION!r}. {regenerate_hint}"
+    )
+    return provenance

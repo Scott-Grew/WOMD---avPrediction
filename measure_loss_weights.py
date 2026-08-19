@@ -1,9 +1,11 @@
-# > Auxiliary neighbour-future head: what it costs and what weight puts it level with the position
-# term. The weight is measured the way the heading weight was - both terms evaluated on an UNTRAINED
-# model, weight = regression / neighbour_future, the ratio that makes the two contributions equal -
-# and it is measured over several batches at more than one batch size because a single-batch ratio is
-# a statistic of one draw. Cost is timed against the same step WITHOUT the head, so the number is the
-# head's own forward, loss and backward rather than the whole step.
+# > Equal-footing loss weights: what weight puts NEIGHBOUR_FUTURE, CLASSIFICATION, HEADING and SPEED level
+# with the REGRESSION term, so all three sit at the same scale as the position loss they are added
+# to. Each weight is measured with both terms evaluated on an UNTRAINED model,
+# weight = regression / other_term, the ratio that makes the two contributions equal - and it is
+# measured over several batches at more than one batch size because a single-batch ratio is a
+# statistic of one draw. Cost is timed as the whole forward + loss + backward step, and reported
+# alongside the weights since the neighbour-future head is the one term whose output size is
+# unbounded.
 
 import argparse
 import time
@@ -40,12 +42,13 @@ def equal_footing_weight(predictor, batch):
     with torch.no_grad():
         (
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-            reachable_distance_metres, selected_unit_anchors, neighbour_future_positions,
+            predicted_speed, selected_unit_anchors, neighbour_future_positions,
         ) = predictor.predict_with_heading(batch)
-        _, regression, classification, heading = loss.prediction_loss(
+        _, regression, heading, classification, speed = loss.prediction_loss(
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+            predicted_speed,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
+            selected_unit_anchors, 1.0, 1.0, 1.0,
         )
         neighbour_future = loss.neighbour_future_loss(
             neighbour_future_positions,
@@ -55,38 +58,33 @@ def equal_footing_weight(predictor, batch):
         )
     return (
         float(regression), float(neighbour_future),
-        float(regression / neighbour_future), float(regression / heading),
+        float(regression / neighbour_future),
         float(regression / classification),
+        float(regression / speed),
+        float(regression / heading),
     )
 
 
-def step_seconds(predictor, batch, with_neighbour_head, repeats):
+def step_seconds(predictor, batch, repeats):
     timings = []
     for _ in range(repeats):
         start = time.perf_counter()
-        if with_neighbour_head:
-            (
-                trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits, reachable_distance_metres, selected_unit_anchors,
-                neighbour_future_positions,
-            ) = predictor.predict_with_heading(batch)
-        else:
-            (
-                _, trajectories, heading_cosine_sine, position_log_standard_deviation,
-                confidence_logits, reachable_distance_metres, selected_unit_anchors,
-            ) = predictor.encode_scene_and_modes(batch)
-        total, _, _, _ = loss.prediction_loss(
+        (
+            trajectories, heading_cosine_sine, position_log_standard_deviation,
+            confidence_logits, predicted_speed, selected_unit_anchors, neighbour_future_positions,
+        ) = predictor.predict_with_heading(batch)
+        total, _, _, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
+            predicted_speed,
             batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, reachable_distance_metres, 1.0, 1.0,
+            selected_unit_anchors, 1.0, 1.0, 1.0,
         )
-        if with_neighbour_head:
-            total = total + loss.neighbour_future_loss(
-                neighbour_future_positions,
-                batch["neighbour_future_positions"],
-                batch["neighbour_future_mask"],
-                batch["neighbour_history_mask"].any(dim=-1),
-            )
+        total = total + loss.neighbour_future_loss(
+            neighbour_future_positions,
+            batch["neighbour_future_positions"],
+            batch["neighbour_future_mask"],
+            batch["neighbour_history_mask"].any(dim=-1),
+        )
         predictor.zero_grad()
         total.backward()
         timings.append(time.perf_counter() - start)
@@ -118,15 +116,16 @@ def main():
     for batch_size in arguments.batch_sizes:
         batches, neighbour_counts = read_batches(scenario_paths, batch_size, arguments.batches)
         ratios = [equal_footing_weight(predictor, batch) for batch in batches]
-        all_ratios.extend(ratio for _, _, ratio, _, _ in ratios)
-        heading_ratios = [heading_ratio for _, _, _, heading_ratio, _ in ratios]
-        classification_ratios = [ratio for _, _, _, _, ratio in ratios]
+        all_ratios.extend(ratio for _, _, ratio, _, _, _ in ratios)
+        classification_ratios = [ratio for _, _, _, ratio, _, _ in ratios]
+        speed_ratios = [ratio for _, _, _, _, ratio, _ in ratios]
+        heading_ratios = [ratio for _, _, _, _, _, ratio in ratios]
         print(
             f"batch size {batch_size}, {len(batches)} batches |"
-            f" regression {np.mean([value for value, _, _, _, _ in ratios]):.3f} nats |"
-            f" neighbour future {np.mean([value for _, value, _, _, _ in ratios]):.3f} m |"
+            f" regression {np.mean([value for value, _, _, _, _, _ in ratios]):.3f} nats |"
+            f" neighbour future {np.mean([value for _, value, _, _, _, _ in ratios]):.3f} m |"
             f" equal-footing weight per batch "
-            + " ".join(f"{ratio:.3f}" for _, _, ratio, _, _ in ratios)
+            + " ".join(f"{ratio:.3f}" for _, _, ratio, _, _, _ in ratios)
         )
         print(
             f"  equal-footing HEADING weight mean {np.mean(heading_ratios):.3f},"
@@ -135,6 +134,10 @@ def main():
         print(
             f"  equal-footing CLASSIFICATION weight mean {np.mean(classification_ratios):.3f},"
             f" per batch " + " ".join(f"{ratio:.3f}" for ratio in classification_ratios)
+        )
+        print(
+            f"  equal-footing SPEED weight mean {np.mean(speed_ratios):.3f},"
+            f" per batch " + " ".join(f"{ratio:.3f}" for ratio in speed_ratios)
         )
         print(
             f"  neighbours per sample over {len(neighbour_counts)} samples:"
@@ -149,13 +152,10 @@ def main():
             f" {64 * np.percentile(neighbour_counts, 50) * contract.FUTURE_STEPS * 2 * 4 / 1e6:.1f} MB"
             f" at the p50 neighbour count"
         )
-        with_head = step_seconds(predictor, batches[0], True, arguments.timing_repeats)
-        without_head = step_seconds(predictor, batches[0], False, arguments.timing_repeats)
+        step_time = step_seconds(predictor, batches[0], arguments.timing_repeats)
         print(
             f"  CPU step (forward + loss + backward), median of {arguments.timing_repeats}:"
-            f" {with_head:.3f} s with the head, {without_head:.3f} s without,"
-            f" added {with_head - without_head:+.3f} s"
-            f" ({(with_head - without_head) / without_head:+.1%})"
+            f" {step_time:.3f} s"
         )
     print(
         f"equal-footing weight over all {len(all_ratios)} batches:"

@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import baseline, contract, loader, model, pipeline
+from womd import baseline, contract, metrics, model, pipeline
 
 RANDOM_DRAW_SEED = 0
 SCENARIO_ORDER_SEED = 0
@@ -40,53 +40,32 @@ SUBMITTED_STEPS = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
 STEP_SETS = ("ade_80step", "ade_16step")
 
 
-def mode_mean_distances(trajectories, future_positions, future_mask):
-    step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
-    validity = future_mask.unsqueeze(1).to(step_distances.dtype)
-    return (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
-
-
 def best_mode_distance(step_set, trajectories, future_positions, future_mask):
     if step_set == "ade_16step":
         trajectories = trajectories[..., SUBMITTED_STEPS, :]
         future_positions = future_positions[:, SUBMITTED_STEPS]
         future_mask = future_mask[:, SUBMITTED_STEPS]
-    return mode_mean_distances(trajectories, future_positions, future_mask).min(dim=1).values
+    return metrics.mean_distance_per_mode(trajectories, future_positions, future_mask).min(dim=1).values
 
 
 def batches_with_lane_null(staged_directory, batch_size, seed):
-    scenario_paths = sorted(staged_directory.glob("*.npz"))
-    samples, lane_null_trajectories, followed_a_lane = [], [], []
-
-    def collated():
-        return (
+    scenario_count = len(sorted(staged_directory.glob("*.npz")))
+    scenario_order = np.random.default_rng(seed).permutation(scenario_count)
+    for batch in pipeline.track_sample_batches(staged_directory, batch_size, True, scenario_order):
+        samples = [sample for _, _, sample in batch]
+        lane_null_trajectories = []
+        followed_a_lane = []
+        for scenario_array, track_index, _ in batch:
+            trajectories, lane_found = baseline.follow_the_lane_predictions(
+                scenario_array, track_index
+            )
+            lane_null_trajectories.append(trajectories)
+            followed_a_lane.append(lane_found)
+        yield (
             pipeline.collate_samples(samples),
             torch.from_numpy(np.stack(lane_null_trajectories)),
             torch.tensor(followed_a_lane),
         )
-
-    for scenario_index in np.random.default_rng(seed).permutation(len(scenario_paths)):
-        scenario_array = loader.read_scenario(scenario_paths[scenario_index])
-        for track_index in loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
-            True,
-        ):
-            samples.append(loader.build_sample(scenario_array, int(track_index)))
-            trajectories, lane_found = baseline.follow_the_lane_predictions(
-                scenario_array, int(track_index)
-            )
-            lane_null_trajectories.append(trajectories)
-            followed_a_lane.append(lane_found)
-            if len(samples) < batch_size:
-                continue
-            yield collated()
-            samples.clear()
-            lane_null_trajectories.clear()
-            followed_a_lane.clear()
-    if samples:
-        yield collated()
 
 
 def main():
@@ -94,9 +73,13 @@ def main():
     staged_directory = Path(sys.argv[2])
     fitted_anchors_path = Path(sys.argv[3])
     with np.load(fitted_anchors_path) as fitted_anchors_file:
+        contract.check_artifact_provenance(
+            fitted_anchors_file["provenance"] if "provenance" in fitted_anchors_file else None,
+            fitted_anchors_path, "Refit them with fit_anchors.py.",
+        )
         unit_anchors = torch.from_numpy(fitted_anchors_file["unit_anchors"])
     predictor = model.MotionPredictor(unit_anchors)
-    predictor.load_state_dict(torch.load(checkpoint_path, map_location="cpu")["model_state"])
+    predictor.load_state_dict(model.load_checkpoint_state(checkpoint_path)["model_state"])
     predictor.eval()
     generator = torch.Generator().manual_seed(RANDOM_DRAW_SEED)
 

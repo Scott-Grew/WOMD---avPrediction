@@ -258,12 +258,10 @@ def follow_the_lane_predictions(scenario_array, track_index):
 
 
 def straight_lines_to_most_used_anchors(batch, unit_anchors):
-    reachable_distance_metres = model.agent_reachable_distance(batch["agent_history"])
     predicted_type_index = model.predicted_type_index(batch["agent_history"])
-    most_used_anchors = unit_anchors[predicted_type_index][
+    endpoints = unit_anchors[predicted_type_index][
         :, : contract.NUM_PREDICTED_MODES
-    ].to(reachable_distance_metres.dtype)
-    endpoints = reachable_distance_metres[:, None, None] * most_used_anchors
+    ].to(batch["agent_history"].dtype)
     elapsed_seconds = future_elapsed_seconds(endpoints.device, endpoints.dtype)
     trajectories = (
         endpoints[:, :, None, :]

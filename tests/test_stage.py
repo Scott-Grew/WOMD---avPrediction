@@ -6,7 +6,7 @@ import pytest
 
 import stage
 from womd import contract, tfrecord
-from waymo_open_dataset.protos import map_pb2, scenario_pb2
+from womd_protos import map_pb2, scenario_pb2
 
 STAGING_PIN_PATH = Path(__file__).parent / "staging_pinned.json"
 
@@ -105,9 +105,15 @@ def stage_fixture(tmp_path):
     return np.load(written_paths[0])
 
 
+def pinned_dtype(array):
+    if array.dtype.kind == "U":
+        return "str"
+    return str(array.dtype)
+
+
 def staged_structure(scenario_file):
     return {
-        key: {"shape": list(scenario_file[key].shape), "dtype": str(scenario_file[key].dtype)}
+        key: {"shape": list(scenario_file[key].shape), "dtype": pinned_dtype(scenario_file[key])}
         for key in sorted(scenario_file.files)
     }
 

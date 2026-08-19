@@ -266,6 +266,11 @@ def with_derived_arrays(scenario_array):
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
         scenario_array = {name: scenario_file[name] for name in scenario_file.files}
+    if "provenance" in scenario_array:
+        contract.check_artifact_provenance(
+            scenario_array["provenance"], scenario_path,
+            "Restage the directory with stage.py.",
+        )
     feature_lengths = scenario_array["feature_lengths"]
     map_row_count = len(scenario_array["map_rows"])
     assert feature_lengths.sum() == map_row_count, (
