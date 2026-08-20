@@ -3,12 +3,9 @@
 # to. Each weight is measured with both terms evaluated on an UNTRAINED model,
 # weight = regression / other_term, the ratio that makes the two contributions equal - and it is
 # measured over several batches at more than one batch size because a single-batch ratio is a
-# statistic of one draw. Cost is timed as the whole forward + loss + backward step, and reported
-# alongside the weights since the neighbour-future head is the one term whose output size is
-# unbounded.
+# statistic of one draw. Step cost is profile_step.py's job, the one timing instrument.
 
 import argparse
-import time
 from pathlib import Path
 
 import numpy as np
@@ -65,32 +62,6 @@ def equal_footing_weight(predictor, batch):
     )
 
 
-def step_seconds(predictor, batch, repeats):
-    timings = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        (
-            trajectories, heading_cosine_sine, position_log_standard_deviation,
-            confidence_logits, predicted_speed, selected_unit_anchors, neighbour_future_positions,
-        ) = predictor.predict_with_heading(batch)
-        total, _, _, _, _ = loss.prediction_loss(
-            trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-            predicted_speed,
-            batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors, 1.0, 1.0, 1.0,
-        )
-        total = total + loss.neighbour_future_loss(
-            neighbour_future_positions,
-            batch["neighbour_future_positions"],
-            batch["neighbour_future_mask"],
-            batch["neighbour_history_mask"].any(dim=-1),
-        )
-        predictor.zero_grad()
-        total.backward()
-        timings.append(time.perf_counter() - start)
-    return float(np.median(timings))
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)
@@ -98,7 +69,6 @@ def main():
     parser.add_argument("--scenarios", type=int, required=True)
     parser.add_argument("--batch-sizes", type=int, nargs="+", required=True)
     parser.add_argument("--batches", type=int, required=True)
-    parser.add_argument("--timing-repeats", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
     arguments = parser.parse_args()
 
@@ -151,11 +121,6 @@ def main():
             f" {head_output_bytes / 1e6:.1f} MB, and"
             f" {64 * np.percentile(neighbour_counts, 50) * contract.FUTURE_STEPS * 2 * 4 / 1e6:.1f} MB"
             f" at the p50 neighbour count"
-        )
-        step_time = step_seconds(predictor, batches[0], arguments.timing_repeats)
-        print(
-            f"  CPU step (forward + loss + backward), median of {arguments.timing_repeats}:"
-            f" {step_time:.3f} s"
         )
     print(
         f"equal-footing weight over all {len(all_ratios)} batches:"

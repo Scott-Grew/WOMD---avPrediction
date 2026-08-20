@@ -165,6 +165,8 @@ def kernel_train_arguments():
 def test_the_kernel_command_line_parses_against_the_real_training_interface(tmp_path):
     literal_arguments, element_count = kernel_train_arguments()
     flag_arguments = literal_arguments[2:]
+    while flag_arguments and not flag_arguments[0].startswith("--"):
+        flag_arguments = flag_arguments[1:]
 
     anchors_path = tmp_path / "training_anchors.npz"
     import numpy as np

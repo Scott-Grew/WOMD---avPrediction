@@ -3,8 +3,11 @@
 # skips biases, LayerNorms, the learned queries and the learned anchors - parameters whose job
 # is to become or stay non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied
 # forward). Decaying the anchors would drag the fan toward the origin, a modelling claim nobody made.
-# LEARNING_RATE 1e-3 and WEIGHT_DECAY 0.01 are Scott's provisional values, 2026-08-13,
-# falsifiable from the first training curve. --heading-loss-weight carries no default: an auxiliary
+# LEARNING_RATE 1e-4 adopted from the field with Scott's approval, 2026-08-19: MTR and EDA
+# (tools/cfgs/waymo/*100_percent_data.yaml in each repo) and HPTR (configs/model/scr_womd.yaml)
+# all train width-256 WOMD models at 1e-4 with AdamW; the provisional 1e-3 was set at width 128
+# and never retested. WEIGHT_DECAY 0.01 is Scott's provisional value, 2026-08-13, and matches
+# MTR's and EDA's own 0.01. --heading-loss-weight carries no default: an auxiliary
 # term's weight is set per run and never inherited from the code. --anchors carries no default
 # either: the initial anchor set decides which futures each mode is assigned, so a run states where
 # it came from. A --resume run overwrites those anchors with the trained ones in the state dict.
@@ -30,7 +33,7 @@ import torch
 from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 LOG_EVERY_BATCHES = 20
 
