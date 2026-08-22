@@ -1,3 +1,4 @@
+import womd.runtime_env
 import math
 import sys
 import time

@@ -11,6 +11,7 @@
 # Reports only - no normalisation constant is chosen, derived or written anywhere here.
 # Run: python3 measure_scales.py ../data/staged
 
+import womd.runtime_env
 import math
 import sys
 import time

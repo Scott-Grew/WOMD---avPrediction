@@ -20,6 +20,7 @@
 # plus an explicit unattributed row account for the parent, so nothing is hidden in a remainder.
 # Run: python3 profile_step.py ../data/staged 4 20
 
+import womd.runtime_env
 import argparse
 import collections
 import functools
@@ -107,9 +108,12 @@ def forward_submodules(predictor):
     for round_index, attention_layer in enumerate(scene_encoder.layers):
         named_modules.append((f"scene attention round {round_index + 1}", attention_layer))
     named_modules.extend(
+        (f"decoder round {round_index + 1}", attention)
+        for round_index, attention in enumerate(decoder.round_attention)
+    )
+    named_modules.extend(
         [
             ("decoder scene norm", decoder.scene_norm),
-            ("decoder cross attention", decoder.cross_attention),
             ("decoder trajectory head", decoder.trajectory_head),
             ("decoder confidence head", decoder.confidence_head),
         ]

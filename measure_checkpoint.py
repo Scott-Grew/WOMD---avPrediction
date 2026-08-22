@@ -25,6 +25,7 @@
 # error has a standard deviation over 2 m and a few hundred samples cannot separate two checkpoints.
 # Run: python3 measure_checkpoint.py checkpoint.pt ../data/staged fitted_anchors.npz
 
+import womd.runtime_env
 import sys
 from pathlib import Path
 

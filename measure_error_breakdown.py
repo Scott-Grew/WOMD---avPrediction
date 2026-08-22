@@ -1,10 +1,11 @@
+import womd.runtime_env
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from womd import contract, metrics, model, pipeline
+from womd import contract, loss, metrics, model, pipeline
 
 BATCH_SIZE = 16
 BUCKET_COUNT = 5
@@ -163,12 +164,16 @@ def main():
         "predicted_to_logged", "logged_to_predicted",
         "mode_path_spread", "winning_mode_path_length",
         "reachable_distance", "logged_endpoint_distance", "widest_anchor_radius",
+        "assigned_heading_error_deg", "sigma_floor_step_fraction",
     )}
     identifiers = []
 
     for batch, scenario_ids, track_ids in batches_with_identifiers(staged_directory, BATCH_SIZE):
         with torch.no_grad():
-            trajectories, confidence_logits = predictor(batch)
+            (
+                trajectories, heading_cosine_sine, position_log_standard_deviation,
+                confidence_logits, _, selected_unit_anchors, _,
+            ) = predictor.predict_with_heading(batch)
         scoreable = batch["future_mask"].any(dim=-1)
         if not scoreable.any():
             continue
@@ -250,6 +255,31 @@ def main():
                 batch["map_chunk_lane_context"][scoreable],
             )
         )
+        assigned_mode = loss.anchor_assigned_mode(
+            selected_unit_anchors[scoreable], future_positions, future_mask,
+        )
+        assigned_heading = heading_cosine_sine[scoreable].gather(
+            1, assigned_mode[:, None, None, None].expand(-1, -1, contract.FUTURE_STEPS, 2)
+        ).squeeze(1)
+        unit_heading = assigned_heading / assigned_heading.norm(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(assigned_heading.dtype).eps
+        )
+        heading_dot = (unit_heading * batch["future_headings"][scoreable]).sum(dim=-1).clamp(-1.0, 1.0)
+        heading_validity = future_mask.to(heading_dot.dtype)
+        columns["assigned_heading_error_deg"].append(
+            torch.rad2deg(
+                (heading_dot.acos() * heading_validity).sum(dim=-1)
+                / heading_validity.sum(dim=-1).clamp_min(1.0)
+            )
+        )
+        assigned_log_sigma = position_log_standard_deviation[scoreable].gather(
+            1, assigned_mode[:, None, None, None].expand(-1, -1, contract.FUTURE_STEPS, 2)
+        ).squeeze(1)
+        sigma_floor = assigned_log_sigma == model.MINIMUM_LOG_STANDARD_DEVIATION
+        columns["sigma_floor_step_fraction"].append(
+            (sigma_floor.any(dim=-1).to(heading_validity.dtype) * heading_validity).sum(dim=-1)
+            / heading_validity.sum(dim=-1).clamp_min(1.0)
+        )
         identifiers.extend(
             pair for pair, keep in zip(zip(scenario_ids, track_ids), scoreable.tolist()) if keep
         )
@@ -302,7 +332,7 @@ def main():
 
     print("\nDOES THE MODEL TURN AT ALL — radians of path bend against the agent's current heading")
     print(f"  {'bucket':26s}{'logged':>9s}{'winning mode':>14s}{'top confidence':>16s}"
-          f"{'widest of 18':>14s}")
+          f"{'widest mode':>14s}")
     for bucket_index, label in enumerate(turn_labels):
         selected = turn_assignment == bucket_index
         print(f"  {label:26s}{np.abs(measured['heading_change'][selected]).mean():9.3f}"
@@ -357,16 +387,30 @@ def main():
         print(f"  {label:26s}{forward:14.3f}{backward:14.3f}{symmetric:11.3f}{timed:14.3f}"
               f"{1.0 - symmetric / timed:14.1%}")
 
-    print("\nMODE UTILISATION — how often each of the model's modes is the closest to the truth")
     winner_counts = np.bincount(measured["winning_mode"], minlength=int(model.QUERY_COUNT))
+    print("\nFAILURE SIGNATURES — the same reads that named run 25 (dead modes) and run 26 (heading ~90°, sigma floor). Not pass marks.")
+    print(
+        f"  assigned-mode heading error p50 {np.percentile(measured['assigned_heading_error_deg'], 50):.1f}°"
+        f"  p90 {np.percentile(measured['assigned_heading_error_deg'], 90):.1f}°"
+        f"  (run 24 was 0.9°; run 26 died at 89.5°)"
+    )
+    print(
+        f"  steps at the sigma floor {100 * measured['sigma_floor_step_fraction'].mean():.1f}%"
+        f"  (run 26 died at 19.8%)"
+    )
+    print(
+        f"  modes that never win: {int((winner_counts == 0).sum())} of {winner_counts.size}"
+        f"  covering 90% of wins:"
+        f" {int(np.searchsorted(np.cumsum(np.sort(winner_counts)[::-1]) / sample_count, 0.9) + 1)}"
+        f"  (run 24: 0 never won, 13 for 90%; run 25 died with 5 never winning)"
+    )
+
+    print("\nMODE UTILISATION — how often each of the model's modes is the closest to the truth")
     for mode_index, count in enumerate(winner_counts):
         print(f"  mode {mode_index:2d}{count:9d}{count / sample_count:9.1%}")
-    print(f"  modes that never win: {int((winner_counts == 0).sum())} of {winner_counts.size}")
-    print(f"  modes covering 90% of wins:"
-          f" {int(np.searchsorted(np.cumsum(np.sort(winner_counts)[::-1]) / sample_count, 0.9) + 1)}")
 
     print(f"\nWORST {WORST_SAMPLE_COUNT} SAMPLES")
-    print(f"  {'scenario':18s}{'track':>7s}{'minADE':>9s}{'bestof18':>10s}{'type':>12s}"
+    print(f"  {'scenario':18s}{'track':>7s}{'minADE':>9s}{'best-of-all':>12s}{'type':>12s}"
           f"{'speed':>8s}{'turn':>8s}{'travel':>9s}{'lanes':>7s}{'signal':>8s}")
     for rank in np.argsort(errors)[::-1][:WORST_SAMPLE_COUNT]:
         scenario_id, track_id = identifiers[rank]

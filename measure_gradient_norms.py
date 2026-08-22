@@ -1,3 +1,4 @@
+import womd.runtime_env
 import argparse
 from pathlib import Path
 
@@ -29,7 +30,6 @@ def main():
         )
         unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
     predictor = MotionPredictor(unit_anchors)
-    optimizer = torch.optim.AdamW(predictor.parameters())
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))
 
     norms = []
@@ -54,12 +54,11 @@ def main():
             neighbour_future_positions, batch["neighbour_future_positions"],
             batch["neighbour_future_mask"], batch["neighbour_history_mask"].any(dim=-1),
         )
-        optimizer.zero_grad()
+        predictor.zero_grad()
         total.backward()
         norms.append(float(torch.nn.utils.clip_grad_norm_(
             predictor.parameters(), float("inf")
         )))
-        optimizer.step()
 
     measured = np.array(norms)
     print(

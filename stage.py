@@ -3,6 +3,7 @@
 # scenario to store.write_scenario, and names each output file by WOMD's globally unique
 # scenario id. Returns paths, never counts - a count can hide a filename collision (B4).
 
+import womd.runtime_env
 import argparse
 from pathlib import Path
 

@@ -1,3 +1,4 @@
+import womd.runtime_env
 import sys
 from pathlib import Path
 

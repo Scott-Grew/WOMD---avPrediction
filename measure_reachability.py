@@ -4,6 +4,7 @@
 # covered when the LANE its nearest lane-centre dot belongs to carries the flag, which is the same
 # nearest-dot rule the loader uses to place the agent on a lane, with no threshold to choose.
 
+import womd.runtime_env
 import argparse
 from pathlib import Path
 

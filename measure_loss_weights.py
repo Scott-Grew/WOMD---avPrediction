@@ -5,6 +5,7 @@
 # measured over several batches at more than one batch size because a single-batch ratio is a
 # statistic of one draw. Step cost is profile_step.py's job, the one timing instrument.
 
+import womd.runtime_env
 import argparse
 from pathlib import Path
 

@@ -4,6 +4,7 @@
 # in /kaggle/working - Save Version snapshots the whole directory and would publish the
 # GCP key into the published dataset.
 
+import womd.runtime_env
 import sys
 from pathlib import Path
 

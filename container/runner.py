@@ -6,10 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPOSITORY_ROOT))
+
+import womd.runtime_env
+import numpy as np
 
 from womd import contract, frame_ops, loader
 

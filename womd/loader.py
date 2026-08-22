@@ -180,7 +180,7 @@ def lane_context_per_polyline(lane_graph, agent_position, agent_heading):
         )
         lane_context[polyline_row, reachable_column] = 1.0
         lane_context[polyline_row, contract.LANE_CONTEXT_GRAPH_DISTANCE] = (
-            distance_metres / contract.DISTANCE_NORMALISER_METRES
+            distance_metres / contract.LANE_CONTEXT_GRAPH_DISTANCE_NORMALISER_METRES
         )
 
     for controlled_lane_id in lane_graph["stop_sign_controlled_lane_ids"]:
@@ -217,6 +217,33 @@ def assigned_lane_signal_histories(
     ]
     return signal_histories
 
+def signed_curvature_per_chunk(positions, directions, chunk_index, chunk_count):
+    curvatures = np.zeros(chunk_count, dtype=np.float32)
+    if chunk_count == 0 or len(positions) < 2:
+        return curvatures
+    same_chunk = chunk_index[1:] == chunk_index[:-1]
+    if not same_chunk.any():
+        return curvatures
+    first = directions[:-1][same_chunk]
+    second = directions[1:][same_chunk]
+    turning_radians = np.arctan2(
+        first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0],
+        (first * second).sum(axis=1),
+    )
+    spacing_metres = np.linalg.norm(positions[1:][same_chunk] - positions[:-1][same_chunk], axis=1)
+    kappa = np.divide(
+        turning_radians, spacing_metres, out=np.zeros_like(turning_radians), where=spacing_metres > 0.0
+    )
+    owner = chunk_index[:-1][same_chunk]
+    totals = np.zeros(chunk_count, dtype=np.float64)
+    counts = np.zeros(chunk_count, dtype=np.float64)
+    np.add.at(totals, owner, kappa)
+    np.add.at(counts, owner, 1.0)
+    np.divide(totals, counts, out=totals, where=counts > 0.0)
+    curvatures[:] = totals
+    return curvatures
+
+
 # Crop the map to the agent's view, reframe it, and cut the surviving dots into the chunks that
 # become attention tokens: at most contract.MAP_CHUNK_DOTS consecutive dots of one polyline, so a
 # token summarises a bounded stretch of road instead of a whole polyline of any length. Chunking
@@ -242,8 +269,15 @@ def crop_and_reframe_map(map_rows, dot_polyline_index, polyline_signal_histories
     dot_chunk_index = (first_chunk_of_polyline[compact_polyline_index]
                        + position_within_polyline // contract.MAP_CHUNK_DOTS)
     chunk_polyline = np.repeat(surviving_polylines, chunks_per_polyline)
+    chunk_lane_context = polyline_lane_context[chunk_polyline].copy()
+    chunk_lane_context[:, contract.LANE_CONTEXT_CURVATURE] = signed_curvature_per_chunk(
+        reframed[:, contract.MAP_POSITION],
+        reframed[:, contract.MAP_DIRECTION],
+        dot_chunk_index,
+        len(chunk_polyline),
+    )
     return (reframed, dot_chunk_index, polyline_signal_histories[chunk_polyline],
-            polyline_lane_context[chunk_polyline])
+            chunk_lane_context)
 
 def with_derived_arrays(scenario_array):
     feature_lengths = scenario_array["feature_lengths"]

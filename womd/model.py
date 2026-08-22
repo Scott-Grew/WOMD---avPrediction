@@ -8,7 +8,7 @@ from torch import nn
 
 from womd import contract
 
-HIDDEN_DIM = 256
+HIDDEN_DIM = 128
 
 
 # One divisor per feature column, applied before each encoder's first Linear. Every distance-like
@@ -201,11 +201,12 @@ class SceneEncoder(nn.Module):
         return tokens, token_present
 
 
-QUERY_COUNT = 18
+QUERY_COUNT = 25
 PRUNE_DISTANCE_METRES = 2.5
-ANCHOR_DIRECTION_COUNT = 6
-ANCHOR_DISTANCE_COUNT = 3
+ANCHOR_DIRECTION_COUNT = 5
+ANCHOR_DISTANCE_COUNT = 5
 assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
+DECODER_ROUNDS = 3
 TRAJECTORY_CONTROL_POINTS = 3
 POSITION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
 HEADING_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
@@ -275,7 +276,9 @@ class ModeDecoder(nn.Module):
         self.anchor_offsets = nn.Parameter(initial_unit_anchors.detach().clone())
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.cross_attention = MultiHeadAttention()
+        self.round_norms = nn.ModuleList(nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS))
+        self.round_attention = nn.ModuleList(MultiHeadAttention() for _ in range(DECODER_ROUNDS))
+        self.draft_projection = nn.Linear(2, HIDDEN_DIM, bias=False)
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
@@ -303,12 +306,26 @@ class ModeDecoder(nn.Module):
     def unit_anchors(self):
         return self.anchor_offsets
 
+    def draft_endpoint(self, queries, unit_anchors, batch_size):
+        control_points = self.trajectory_head(queries)[..., :POSITION_CONTROL_VALUES].view(
+            batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2
+        )
+        return torch.matmul(self.curve_basis[-1], control_points) + unit_anchors
+
     def decode_from_anchors(self, normed_tokens, token_present, unit_anchors, batch_size):
         queries = self.queries + self.anchor_projection(
             unit_anchors / contract.DISTANCE_NORMALISER_METRES
         )
-        read = queries + self.cross_attention(queries, normed_tokens, token_present)
-        head_output = self.trajectory_head(read)
+        for round_index, (round_norm, round_attention) in enumerate(
+            zip(self.round_norms, self.round_attention)
+        ):
+            queries = queries + round_attention(round_norm(queries), normed_tokens, token_present)
+            if round_index + 1 < DECODER_ROUNDS:
+                queries = queries + self.draft_projection(
+                    self.draft_endpoint(queries, unit_anchors, batch_size)
+                    / contract.DISTANCE_NORMALISER_METRES
+                )
+        head_output = self.trajectory_head(queries)
         control_points = head_output[..., :POSITION_CONTROL_VALUES].view(
             batch_size, QUERY_COUNT, TRAJECTORY_CONTROL_POINTS, 2
         )
@@ -322,7 +339,7 @@ class ModeDecoder(nn.Module):
         position_log_standard_deviation = torch.matmul(
             self.curve_basis, log_standard_deviation_control_points
         ).clamp(MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION)
-        confidence_logits = self.confidence_head(read).squeeze(-1)
+        confidence_logits = self.confidence_head(queries).squeeze(-1)
         anchored_position = (
             torch.matmul(self.curve_basis, control_points)
             + unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]

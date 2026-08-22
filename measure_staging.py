@@ -15,6 +15,7 @@
 # Run: python3 measure_staging.py ../data/validation_raw/validation.tfrecord-00000-of-00150 --fine-spacing-metres
 # 0.5 --coarse-spacing-metres 1.0
 
+import womd.runtime_env
 import argparse
 import time
 from pathlib import Path

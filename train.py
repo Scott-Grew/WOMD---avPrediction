@@ -3,10 +3,12 @@
 # skips biases, LayerNorms, the learned queries and the learned anchors - parameters whose job
 # is to become or stay non-zero, which decay would fight (the 2026-08-06 optimizer incident, applied
 # forward). Decaying the anchors would drag the fan toward the origin, a modelling claim nobody made.
-# LEARNING_RATE 1e-4 adopted from the field with Scott's approval, 2026-08-19: MTR and EDA
-# (tools/cfgs/waymo/*100_percent_data.yaml in each repo) and HPTR (configs/model/scr_womd.yaml)
-# all train width-256 WOMD models at 1e-4 with AdamW; the provisional 1e-3 was set at width 128
-# and never retested. WEIGHT_DECAY 0.01 is Scott's provisional value, 2026-08-13, and matches
+# LEARNING_RATE 2e-3 with HIDDEN_DIM 128, Scott 2026-08-21: a new from-scratch run after run 27
+# at 1e-3 landed held-out 1.447 m, still descending when cosine hit zero. 1e-4 at 6-8 epochs
+# undertrained at this width and the 9 h Kaggle cap (Scott 2026-08-20). MTR/EDA/HPTR pair 1e-4
+# with width ~256 and ~30 epochs over the full split on multi-GPU; that pairing does not transfer
+# to one T4 session. Run 24 at 128 and 1e-3 reached 1.786 while still descending 0.09 in its final
+# epoch with no train/held-out gap. WEIGHT_DECAY 0.01 is Scott's provisional value, 2026-08-13, and matches
 # MTR's and EDA's own 0.01. --heading-loss-weight carries no default: an auxiliary
 # term's weight is set per run and never inherited from the code. --anchors carries no default
 # either: the initial anchor set decides which futures each mode is assigned, so a run states where
@@ -22,6 +24,7 @@
 # non-finite total, or a GradScaler skipping the step because the gradient was not finite, both
 # leave the printed loss curve looking healthy. They are COUNTED and printed, never thresholded.
 
+import womd.runtime_env
 import argparse
 import math
 import time
@@ -33,7 +36,7 @@ import torch
 from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-3
 WEIGHT_DECAY = 0.01
 LOG_EVERY_BATCHES = 20
 
@@ -139,6 +142,7 @@ def train_epoch(
     non_finite_total_count = 0
     gradient_scaler_skip_count = 0
     clipped_step_count = 0
+    window_winner_counts = torch.zeros(QUERY_COUNT, dtype=torch.long, device=device)
     wait_start = time.perf_counter()
     checkpoint_wait_start = time.perf_counter()
     for batch in batches:
@@ -206,6 +210,12 @@ def train_epoch(
                 trajectories.detach().float(), confidence_logits.detach().float(),
                 batch["future_positions"], batch["future_mask"],
             )
+            window_winners = metrics.mean_distance_per_mode(
+                trajectories.detach().float(), batch["future_positions"], batch["future_mask"],
+            ).argmin(dim=1)
+            window_winner_counts.scatter_add_(
+                0, window_winners, torch.ones_like(window_winners)
+            )
         seconds["monitor"] += time.perf_counter() - monitor_start
 
         batch_count += 1
@@ -222,6 +232,20 @@ def train_epoch(
             median_heading_norm = float(
                 heading_cosine_sine.detach().float().norm(dim=-1).median()
             )
+            winner_counts = window_winner_counts.cpu()
+            never_win_count = int((winner_counts == 0).sum())
+            winner_total = int(winner_counts.sum())
+            cover_ninety = (
+                int(
+                    torch.searchsorted(
+                        winner_counts.sort(descending=True).values.cumsum(0).to(torch.float64),
+                        torch.tensor(0.9 * winner_total, dtype=torch.float64),
+                    )
+                    + 1
+                )
+                if winner_total
+                else QUERY_COUNT
+            )
             peak_gigabytes = (
                 torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
             )
@@ -233,7 +257,8 @@ def train_epoch(
                 f"ade_80step {monitor['min_ade']:.3f} (window {window_monitor['min_ade']:.3f}) "
                 f"fde_80step {monitor['min_fde']:.3f} (window {window_monitor['min_fde']:.3f}) | "
                 f"kept modes {window_monitor['mean_kept_modes']:.2f} "
-                f"backfilled {100 * window_monitor['backfill_rate']:.0f}% | "
+                f"backfilled {100 * window_monitor['backfill_rate']:.0f}% "
+                f"never-win {never_win_count}/{QUERY_COUNT} cover90 {cover_ninety} | "
                 f"hdg/reg {heading_loss_weight * window_loss_sums['heading'] / max(window_loss_sums['regression'], 1e-12):.4f} "
                 f"hdg norm {median_heading_norm:.4f} | "
                 f"nbr/reg {neighbour_future_loss_weight * window_loss_sums['neighbour_future'] / max(window_loss_sums['regression'], 1e-12):.4f} "
@@ -254,6 +279,7 @@ def train_epoch(
             window_accumulator = metrics.MetricAccumulator()
             window_loss_sums = dict.fromkeys(loss_sums, 0.0)
             window_peak_tokens = 0
+            window_winner_counts.zero_()
         if time.perf_counter() - checkpoint_wait_start >= checkpoint_every_seconds:
             if math.isfinite(component_values["total"]):
                 save_checkpoint(
@@ -323,7 +349,8 @@ def main():
     total_optimiser_steps = steps_per_epoch * arguments.epochs
     print(
         f"{steps_per_epoch} optimiser steps per epoch,"
-        f" {total_optimiser_steps} over {arguments.epochs} epochs",
+        f" {total_optimiser_steps} over {arguments.epochs} epochs,"
+        f" peak learning rate {LEARNING_RATE}",
         flush=True,
     )
     previous_checkpoint_path = arguments.checkpoint_path.with_suffix(

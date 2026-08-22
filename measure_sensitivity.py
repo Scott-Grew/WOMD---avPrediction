@@ -1,3 +1,4 @@
+import womd.runtime_env
 import sys
 from collections import namedtuple
 from functools import partial
@@ -39,7 +40,7 @@ LANE_CONTEXT_SELECTORS = tuple(sorted(
     (
         (name, column)
         for name, column in vars(contract).items()
-        if name.startswith("LANE_CONTEXT_") and name != "LANE_CONTEXT_DIM"
+        if name.startswith("LANE_CONTEXT_") and name != "LANE_CONTEXT_DIM" and isinstance(column, int)
     ),
     key=lambda named_column: named_column[1],
 ))

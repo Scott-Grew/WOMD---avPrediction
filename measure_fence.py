@@ -9,6 +9,7 @@
 # which would read as an agent that drove less than it did.
 # Run: python3 measure_fence.py ../data/staged
 
+import womd.runtime_env
 import sys
 from pathlib import Path
 

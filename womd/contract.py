@@ -31,6 +31,7 @@ assert SUBMISSION_FUTURE_INDICES[-1] == FUTURE_STEPS - 1
 
 # > FEATURE SCALES. STANDARD DEVIATIONS MEASURED ON THIS PROJECT'S OWN STAGED DATA, NOT CHOSEN.
 DISTANCE_NORMALISER_METRES = 65.8               # measure_scales.py on an every-60th slice of ../data/staged_training, 2,040 scenarios / 9,168 designated-target samples, 2026-08-15: standard deviation of map position, 142,557,186 values. Every distance-like quantity divides by this one number so geometry is preserved. Remeasured on TRAINING data after the lane-change walk and per-agent signals landed; the prior 67.9 was measured on the validation slice the model is scored on.
+LANE_CONTEXT_GRAPH_DISTANCE_NORMALISER_METRES = 321.3  # STATUS 2026-08-15 defect measurement on staged data: p50 of reachable graph-distance metres. Map-position std (65.8) is the wrong scale; using it let this column dominate the map token. p50 puts a typical reachable lane at O(1).
 VELOCITY_NORMALISER_METRES_PER_SECOND = 3.9     # measure_scales.py on the same 2026-08-15 training slice: standard deviation of agent and neighbour velocity pooled from the printed per-group moments (196,560 agent + 7,692,118 neighbour values).
 DIMENSION_NORMALISER_METRES = 1.6               # measure_scales.py on the same 2026-08-15 training slice: pooled agent and neighbour dimension standard deviation 1.56, within 3% of the prior validation-slice figure.
 SPEED_LIMIT_NORMALISER_MILES_PER_HOUR = 12.9    # measure_scales.py on the every-60th training slice, 2,040 scenarios / 9,168 samples, 2026-08-15: standard deviation of map speed limit over the rows where it applies. The column is map.proto LaneCenter.speed_limit_mph = 4 and is stored unconverted, so the divisor is in miles per hour - it was measured on that same column, so the scale is right and only the former metres-per-second name was wrong. Heading cosine/sine and map direction arrows are unit-scale already (measured max abs 1.000) and are not divided.
@@ -174,10 +175,11 @@ STOP_SIGN_LANE_WIDTH = STOP_SIGN_CONTROLLED_LANE + 1
 
 LANE_CONTEXT_REACHABLE = 0
 LANE_CONTEXT_GRAPH_DISTANCE = 1
-LANE_CONTEXT_AGENT_LANE_DISTANCE = 2            # Scott 2026-08-15, replacing a LANE_FOUND flag that shipped CONSTANT: an argmin over lane dots with no threshold (the only form the no-invented-benchmark rule allows) always finds a lane, and 0 of 287 staged scenarios have none, so the flag never fired. The metres from the agent to its nearest lane centre dot say the same thing continuously with nothing to choose - measured over 1,278 designated targets, p50 0.47 m, p95 4.70 m, max 27.76 m, 4.5% beyond 5 m.
+LANE_CONTEXT_AGENT_LANE_DISTANCE = 2            # Scott 2026-08-15, replacing a LANE_FOUND flag that shipped CONSTANT: an argmin over lane dots with no threshold (the only form the no-invented-benchmark rule allows) always finds a lane, and 0 of 287 staged scenarios have none, so the flag never fired. The metres from the agent to its nearest lane centre dot say the same thing continuously with nothing to choose - measured over 1,278 designated targets, p50 0.47 m, p95 4.70 m, 4.5% beyond 5 m.
 LANE_CONTEXT_HAS_STOP_SIGN = 3
 LANE_CONTEXT_REACHABLE_BY_LANE_CHANGE = 4
-LANE_CONTEXT_DIM = 5
+LANE_CONTEXT_CURVATURE = 5                      # Scott 2026-08-16: signed 1/radius from consecutive direction arrows on the chunk's own 1 m dots. Run 24's error is along-track through turns; 20-dot max-pool drops the arrow-to-arrow change. No restage: derived at load from stored dots.
+LANE_CONTEXT_DIM = 6
 
 # > ARTIFACT PROVENANCE. Set 2026-08-19 after two incidents the same week: training_anchors.npz
 # silently overwritten by a refit under a different scheme (a control read 426 m against its

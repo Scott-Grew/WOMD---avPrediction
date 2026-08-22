@@ -1,3 +1,4 @@
+import womd.runtime_env
 import argparse
 import subprocess
 import sys
